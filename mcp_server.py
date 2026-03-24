@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v4.0.0.
+"""Free Web Search MCP Server v4.1.0.
 
 Zero-cost web search and content extraction via MCP protocol.
-Uses DuckDuckGo Lite + Mojeek + Qwant for search (parallel, first-wins),
+Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
 DDG Instant Answer API for factual queries, Wikipedia REST API for encyclopedic
 summaries, and Jina AI Reader / trafilatura for content extraction.
 No API keys required.
@@ -213,6 +213,35 @@ def _extract_domain(url: str) -> str:
     return parsed.netloc.lower().lstrip("www.")
 
 
+def _is_valid_url(url: str) -> bool:
+    """Reject URLs with invalid characters (Unicode garbage, missing scheme, etc.)."""
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return False
+        # Reject non-ASCII in domain/path — catches '›' (U+203A) and similar garbage
+        for c in parsed.netloc + parsed.path:
+            if ord(c) > 127:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _sanitize_url(url: str) -> str:
+    """Clean common URL corruption from search engine HTML parsing.
+
+    Handles: '›' (U+203A) used as visual separator, stray whitespace, etc.
+    """
+    # Replace Unicode angle brackets used as visual path separators
+    url = url.replace("\u203a", "/").replace("\u00bb", "/").replace("›", "/")
+    # Collapse multiple slashes
+    url = re.sub(r'/+', '/', url)
+    return url.strip()
+
+
 def _domain_matches(url: str, domain: str) -> bool:
     """Check if a URL's domain matches (including subdomains).
 
@@ -368,7 +397,12 @@ async def search_mojeek(
     max_results: int = 10,
     language: str | None = None,
 ) -> list[SearchResult]:
-    """Search via Mojeek (independent search engine, free, unlimited)."""
+    """Search via Mojeek (independent search engine, free, unlimited).
+
+    Mojeek HTML structure: all results are in a single container. Each result has
+    two <a> tags with the same href — first is the URL display (with › separators),
+    second is the actual title. Snippets are in following <p> tags.
+    """
     params: dict[str, str] = {"q": query}
     if language and language in LANGUAGE_KL_MAP:
         lang_code = language.split("-")[0] if "-" in language else language
@@ -387,65 +421,86 @@ async def search_mojeek(
         results: list[SearchResult] = []
         seen_urls: set[str] = set()
 
-        # Mojeek wraps results in divs with class "result" or specific structure
-        for result_div in soup.select("div.result, div[class*='result'], article"):
-            a = result_div.select_one("a[href^='http']")
-            if not a:
-                continue
+        # Mojeek result structure: pairs of <a> tags with same href.
+        # First <a> has URL display text (contains ›), second has title.
+        # Snippet follows in a <p> tag.
+        all_links = soup.find_all("a", href=True)
+        prev_href = None
+
+        for a in all_links:
             href = a.get("href", "")
-            if any(d in href for d in _SKIP_DOMAINS) or href in seen_urls:
+            text = a.get_text(strip=True)
+
+            # Skip non-external links
+            if not href.startswith("http"):
                 continue
-            title = clean_title(a.get_text(strip=True))
-            if len(title) < 15:
+            # Skip internal Mojeek links
+            if "mojeek.com" in href:
                 continue
+            # Skip URL display links — they contain › or start with http
+            # We want the TITLE links which come second with the same href
+            is_url_display = text.startswith("http") or "›" in text or "\u203a" in text
+            if is_url_display:
+                prev_href = href  # Remember this URL for the next <a>
+                continue
+
+            # This is a title link
+            if not _is_valid_url(href) or href in seen_urls:
+                prev_href = None
+                continue
+            if any(d in href for d in _SKIP_DOMAINS):
+                prev_href = None
+                continue
+
+            title = clean_title(text)
+            if len(title) < 10:
+                prev_href = None
+                continue
+
             seen_urls.add(href)
-            # Snippet from abbr, p, or span inside the result div
+
+            # Find snippet: look at next sibling elements for a <p> with content.
+            # Mojeek has two <p> tags per result: first is URL display (skip),
+            # second is the actual snippet.
             snippet = ""
-            for el in result_div.select("p, span, abbr, .s, .desc"):
-                t = el.get_text(strip=True)
-                if len(t) > 30 and t != title:
-                    snippet = t
-                    break
+            sibling = a.next_element
+            p_count = 0
+            while sibling and not isinstance(sibling, str):
+                if hasattr(sibling, 'name') and sibling.name == 'p':
+                    p_text = sibling.get_text(strip=True)
+                    p_count += 1
+                    # Skip first <p> (URL display) and "See more results" links
+                    is_url_display = (p_text.startswith("http") or "›" in p_text
+                                      or p_text.startswith("See more"))
+                    if not is_url_display and len(p_text) > 20:
+                        snippet = p_text
+                        break
+                    # Only check the first 3 <p> tags
+                    if p_count >= 3:
+                        break
+                sibling = sibling.next_element
+
             results.append(SearchResult(title=title, url=href, snippet=snippet, source="mojeek"))
+            prev_href = None
             if len(results) >= max_results:
                 break
-
-        # Fallback: if no results found with specific selectors, try broader approach
-        if not results:
-            for item in soup.select("li, div"):
-                a = item.select_one("a[href^='http']")
-                if not a:
-                    continue
-                href = a.get("href", "")
-                if any(d in href for d in _SKIP_DOMAINS) or href in seen_urls:
-                    continue
-                title = clean_title(a.get_text(strip=True))
-                if len(title) < 20:
-                    continue
-                seen_urls.add(href)
-                snippet = ""
-                for p in item.select("p, span"):
-                    t = p.get_text(strip=True)
-                    if len(t) > 30 and t != title:
-                        snippet = t
-                        break
-                results.append(SearchResult(title=title, url=href, snippet=snippet, source="mojeek"))
-                if len(results) >= max_results:
-                    break
 
         return results
 
 
 # ---------------------------------------------------------------------------
-# Qwant — search backend (free, EU-based, privacy-focused)
+# Startpage — search backend (Google proxy, works in China, English results)
 # ---------------------------------------------------------------------------
 
-async def search_qwant(
+_STARTPAGE_SKIP = _SKIP_DOMAINS | frozenset(["startpage.com"])
+
+
+async def search_startpage(
     query: str,
     max_results: int = 10,
 ) -> list[SearchResult]:
-    """Search via Qwant (EU privacy search engine, free, no API key)."""
-    params: dict[str, str] = {"q": query, "t": "web"}
+    """Search via Startpage (Google proxy, returns English results, works in China)."""
+    params: dict[str, str] = {"query": query}
 
     async with httpx.AsyncClient(
         headers=_search_headers(),
@@ -453,36 +508,113 @@ async def search_qwant(
         timeout=httpx.Timeout(15.0, connect=8.0),
         http1=True,
     ) as client:
-        resp = await _retry_async(client.get, retries=1, url="https://www.qwant.com/", params=params)
+        resp = await _retry_async(client.get, retries=1, url="https://www.startpage.com/search", params=params)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "lxml")
         results: list[SearchResult] = []
         seen_urls: set[str] = set()
 
-        # Qwant results are in specific containers
-        for item in soup.select("[class*='result'], [class*='web-result'], .tile"):
-            a = item.select_one("a[href^='http']")
+        for div in soup.select("div.result"):
+            # Title and URL from a.result-title (direct URL, no redirect)
+            a = div.select_one("a.result-title")
             if not a:
                 continue
+
             href = a.get("href", "")
-            # Skip Qwant internal links
-            if "qwant.com" in href or href in seen_urls:
+            if not _is_valid_url(href) or href in seen_urls:
                 continue
-            if any(d in href for d in _SKIP_DOMAINS):
+            if any(d in href for d in _STARTPAGE_SKIP):
                 continue
+
             title = clean_title(a.get_text(strip=True))
-            if len(title) < 15:
+            if len(title) < 5:
                 continue
+
             seen_urls.add(href)
-            # Snippet
+
+            # Snippet from p.description
             snippet = ""
-            for el in item.select("p, span, .desc, .url__desc"):
-                t = el.get_text(strip=True)
-                if len(t) > 30 and t != title:
-                    snippet = t
-                    break
-            results.append(SearchResult(title=title, url=href, snippet=snippet, source="qwant"))
+            p = div.select_one("p.description")
+            if p:
+                snippet = p.get_text(strip=True)
+
+            results.append(SearchResult(title=title, url=href, snippet=snippet, source="startpage"))
+            if len(results) >= max_results:
+                break
+
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Bing — search backend (reliable, works globally including China)
+# ---------------------------------------------------------------------------
+
+_BING_SKIP_DOMAINS = _SKIP_DOMAINS | frozenset(["bing.com", "microsoft.com", "live.com"])
+
+
+async def search_bing(
+    query: str,
+    max_results: int = 10,
+    language: str | None = None,
+) -> list[SearchResult]:
+    """Search via Bing (uses <cite> for actual URLs, bypasses redirect tracking)."""
+    params: dict[str, str] = {"q": query}
+    # Force English market to avoid geo-targeted results (e.g., Chinese results in China)
+    if language and language != "en":
+        params["setlang"] = language
+    else:
+        params["mkt"] = "en-US"
+
+    async with httpx.AsyncClient(
+        headers=_search_headers(),
+        follow_redirects=True,
+        timeout=httpx.Timeout(15.0, connect=8.0),
+        http1=True,
+    ) as client:
+        resp = await _retry_async(client.get, retries=1, url="https://www.bing.com/search", params=params)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        results: list[SearchResult] = []
+        seen_urls: set[str] = set()
+
+        for li in soup.select("li.b_algo"):
+            a = li.select_one("h2 a")
+            if not a:
+                continue
+
+            # Extract actual URL from <cite> element (Bing hrefs are redirect URLs)
+            cite = li.select_one("cite")
+            url = ""
+            if cite:
+                cite_text = cite.get_text(strip=True).replace("›", "/").replace("\u203a", "/")
+                # cite might be like "https://www.python.org" or "www.python.org › ... › ..."
+                # Take only the first part before any whitespace/special chars
+                cite_text = re.split(r'[\s\u203a›]+', cite_text)[0]
+                if cite_text.startswith("//"):
+                    cite_text = "https:" + cite_text
+                elif cite_text.startswith("www."):
+                    cite_text = "https://" + cite_text
+                url = cite_text
+
+            if not _is_valid_url(url) or url in seen_urls:
+                continue
+            if any(d in url for d in _BING_SKIP_DOMAINS):
+                continue
+            seen_urls.add(url)
+
+            title = clean_title(a.get_text(strip=True))
+            if len(title) < 5:
+                continue
+
+            # Snippet from paragraph
+            snippet = ""
+            p = li.select_one("p, .b_caption p")
+            if p:
+                snippet = p.get_text(strip=True)
+
+            results.append(SearchResult(title=title, url=url, snippet=snippet, source="bing"))
             if len(results) >= max_results:
                 break
 
@@ -499,12 +631,13 @@ async def _parallel_search(
     time_range: str | None = None,
     language: str | None = None,
 ) -> list[SearchResult]:
-    """Race DDG Lite, Mojeek, and Qwant in parallel; return first that produces results."""
+    """Race DDG Lite, Mojeek, Bing, and Startpage in parallel; return first that produces results."""
     ddg_task = asyncio.create_task(search_ddg_lite(query, max_results, time_range, language))
     mojeek_task = asyncio.create_task(search_mojeek(query, max_results, language))
-    qwant_task = asyncio.create_task(search_qwant(query, max_results))
+    bing_task = asyncio.create_task(search_bing(query, max_results, language))
+    startpage_task = asyncio.create_task(search_startpage(query, max_results))
 
-    pending = {ddg_task, mojeek_task, qwant_task}
+    pending = {ddg_task, mojeek_task, bing_task, startpage_task}
 
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -659,9 +792,9 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
     # Use the already-fetched HTML instead of fetching again
     doc = trafilatura.bare_extraction(resp.text)
 
-    if doc and doc.as_text():
+    if doc and doc.text:
         return ExtractedContent(
-            content=doc.as_text(),
+            content=doc.text,
             title=doc.title or "",
             url=url,
             date=doc.date or "",
@@ -687,6 +820,60 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
 
 
 # ---------------------------------------------------------------------------
+# Arxiv-specific content extraction
+# ---------------------------------------------------------------------------
+
+async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
+    """Extract content from arxiv papers via direct HTML parsing of /abs/ page."""
+    # Convert /html/ to /abs/ for reliable parsing
+    abs_url = re.sub(r'arxiv\.org/html/', 'arxiv.org/abs/', url)
+
+    try:
+        resp = await client.get(abs_url, timeout=15.0)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Extract metadata
+        title_el = soup.select_one("h1.title, .title")
+        abstract_el = soup.select_one("blockquote.abstract, .abstract")
+        author_els = soup.select("div.authors a")
+
+        title = ""
+        if title_el:
+            title = title_el.get_text(strip=True).replace("Title:", "").strip()
+
+        abstract = ""
+        if abstract_el:
+            abstract = abstract_el.get_text(strip=True).replace("Abstract:", "").strip()
+
+        authors = ", ".join(a.get_text(strip=True) for a in author_els[:10])
+
+        if not title and not abstract:
+            return None
+
+        content_parts = []
+        if title:
+            content_parts.append(f"# {title}\n")
+        if authors:
+            content_parts.append(f"**Authors:** {authors}\n")
+        content_parts.append(f"**URL:** {abs_url}\n")
+        content_parts.append(f"**PDF:** {abs_url.replace('/abs/', '/pdf/')}\n")
+        if abstract:
+            content_parts.append(f"\n## Abstract\n\n{abstract}")
+
+        return ExtractedContent(
+            content="\n".join(content_parts),
+            title=title,
+            url=url,
+            author=authors,
+            extraction_method="arxiv_direct",
+        )
+    except Exception as e:
+        logger.warning("Arxiv direct fetch failed: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Content fetcher with fallback chain
 # ---------------------------------------------------------------------------
 
@@ -696,11 +883,18 @@ async def fetch_content(
     return_format: str = "markdown",
     with_links: bool = False,
 ) -> ExtractedContent:
-    """Fetch readable content from a URL with Jina JSON -> trafilatura fallback."""
+    """Fetch readable content from a URL with arxiv-aware -> Jina JSON -> trafilatura fallback."""
     if not url.startswith(("http://", "https://")):
         raise ValueError(f"Invalid URL scheme: {url}. Must start with http:// or https://")
 
     client = _get_shared_client()
+
+    # Arxiv-specific handling: Jina returns empty for arxiv HTML papers
+    if "arxiv.org" in url:
+        ec = await _fetch_arxiv(client, url)
+        if ec and ec.content and len(ec.content.strip()) > 50:
+            ec.content = _smart_truncate(ec.content, max_length)
+            return ec
 
     try:
         ec = await fetch_with_jina(client, url, return_format, with_links)
@@ -729,6 +923,8 @@ def post_process_results(results: list[SearchResult]) -> list[SearchResult]:
     """Apply all quality filters to search results."""
     processed: list[SearchResult] = []
     for r in results:
+        if not _is_valid_url(r.url):
+            continue
         r.url = normalize_url(r.url)
         r.title = clean_title(r.title)
         r.snippet = cap_snippet(r.snippet)
@@ -768,7 +964,7 @@ def format_search_results(results: list[SearchResult], query: str, tool_name: st
         return f"## {tool_name}: {query}\n\nNo results found. Try rephrasing or simplifying the query."
 
     source = results[0].source
-    source_labels = {"duckduckgo": "DuckDuckGo", "mojeek": "Mojeek", "qwant": "Qwant"}
+    source_labels = {"duckduckgo": "DuckDuckGo", "mojeek": "Mojeek", "bing": "Bing", "startpage": "Startpage"}
     source_label = source_labels.get(source, source)
 
     lines = [f"## {tool_name}: {query}\n"]
@@ -1031,7 +1227,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="4.0.0")
+server = Server("free-web-search", version="4.1.0")
 
 
 @server.list_tools()
@@ -1041,7 +1237,7 @@ async def list_tools() -> list[Tool]:
             name="web_search",
             description=(
                 "Search the web for information. Returns ranked results with titles, URLs, and snippets. "
-                "Uses DuckDuckGo + Mojeek + Qwant in parallel (first-wins for speed). "
+                "Uses DuckDuckGo + Mojeek + Bing + Startpage in parallel (first-wins for speed). "
                 "Supports time-range filtering, language selection, and domain filtering.\n\n"
                 "Supports `site:` operator (e.g. `query=\"react hooks site:github.com\"`)\n\n"
                 "Examples:\n"
@@ -1092,7 +1288,7 @@ async def list_tools() -> list[Tool]:
             name="news_search",
             description=(
                 "Search for recent news and current events. Defaults to last week. "
-                "Uses DuckDuckGo + Mojeek + Qwant in parallel.\n\n"
+                "Uses DuckDuckGo + Mojeek + Bing + Startpage in parallel.\n\n"
                 "Examples:\n"
                 '- news_search(query="AI breakthroughs")\n'
                 '- news_search(query="space exploration", time_range="week")\n'
