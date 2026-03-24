@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v4.1.0.
+"""Free Web Search MCP Server v4.2.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -34,6 +34,13 @@ logger = logging.getLogger("free-web-search")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+BING_FRESHNESS_MAP = {
+    "day": "ez5_80505_",
+    "week": "ez5_80506_",
+    "month": "ez5_80507_",
+    "year": "ez5_80508_",
+}
 
 DDG_TIME_RANGE_MAP = {
     "day": "d",
@@ -93,7 +100,7 @@ _TRACKING_PARAMS = frozenset([
 _SKIP_DOMAINS = frozenset([
     "mojeek.com", "blocksurvey.io", "facebook.com", "twitter.com",
     "linkedin.com", "instagram.com", "youtube.com/results",
-    "duckduckgo.com", "qwant.com",
+    "duckduckgo.com",
 ])
 
 # ---------------------------------------------------------------------------
@@ -105,7 +112,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str
-    source: str = ""  # "duckduckgo", "mojeek", or "qwant"
+    source: str = ""  # "duckduckgo", "mojeek", "bing", or "startpage"
 
 
 @dataclass
@@ -315,6 +322,43 @@ def _smart_truncate(text: str, max_length: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Query parsing utilities
+# ---------------------------------------------------------------------------
+
+def _parse_site_operator(query: str) -> tuple[str, list[str]]:
+    """Extract site:domain.com operators from query, return (cleaned_query, [domains])."""
+    domains: list[str] = []
+    # Match site: followed by a domain (letters, digits, dots, hyphens)
+    clean = re.sub(r'\bsite:([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})\b', lambda m: (domains.append(m.group(1)) or ''), query)
+    clean = clean.strip()
+    # If query is now empty after removing site: operators, use a generic search
+    if not clean and domains:
+        clean = domains[0]
+    return clean, domains
+
+
+def _extract_wiki_query(query: str) -> str:
+    """Strip question words from query to extract a Wikipedia article title.
+
+    "What is quantum entanglement?" -> "quantum entanglement"
+    "Who invented the telephone?" -> "telephone"
+    """
+    q = query.strip().rstrip("?!.!")
+    # Remove common question prefixes (case-insensitive)
+    q = re.sub(
+        r'^(what\s+(?:is|are|was|were)\s+|who\s+(?:is|are|was|were|invented|discovered|created)\s+|'
+        r'when\s+(?:was|were|is|did)\s+|where\s+(?:is|are|was|were)\s+|'
+        r'how\s+(?:does|do|did|is|are|was|were)\s+|why\s+(?:do|does|did|is|are|was|were)\s+)',
+        '', q, flags=re.IGNORECASE,
+    )
+    # Remove common filler words
+    q = re.sub(r'\b(?:the|a|an|of|in|for|to|about)\b', '', q, flags=re.IGNORECASE)
+    # Collapse whitespace and strip
+    q = re.sub(r'\s+', ' ', q).strip()
+    return q
+
+
+# ---------------------------------------------------------------------------
 # Shared HTTP headers for search backends
 # ---------------------------------------------------------------------------
 
@@ -425,7 +469,6 @@ async def search_mojeek(
         # First <a> has URL display text (contains ›), second has title.
         # Snippet follows in a <p> tag.
         all_links = soup.find_all("a", href=True)
-        prev_href = None
 
         for a in all_links:
             href = a.get("href", "")
@@ -441,20 +484,16 @@ async def search_mojeek(
             # We want the TITLE links which come second with the same href
             is_url_display = text.startswith("http") or "›" in text or "\u203a" in text
             if is_url_display:
-                prev_href = href  # Remember this URL for the next <a>
                 continue
 
             # This is a title link
             if not _is_valid_url(href) or href in seen_urls:
-                prev_href = None
                 continue
             if any(d in href for d in _SKIP_DOMAINS):
-                prev_href = None
                 continue
 
             title = clean_title(text)
             if len(title) < 10:
-                prev_href = None
                 continue
 
             seen_urls.add(href)
@@ -481,7 +520,6 @@ async def search_mojeek(
                 sibling = sibling.next_element
 
             results.append(SearchResult(title=title, url=href, snippet=snippet, source="mojeek"))
-            prev_href = None
             if len(results) >= max_results:
                 break
 
@@ -498,9 +536,12 @@ _STARTPAGE_SKIP = _SKIP_DOMAINS | frozenset(["startpage.com"])
 async def search_startpage(
     query: str,
     max_results: int = 10,
+    time_range: str | None = None,
 ) -> list[SearchResult]:
     """Search via Startpage (Google proxy, returns English results, works in China)."""
     params: dict[str, str] = {"query": query}
+    if time_range in ("day", "week", "month", "year"):
+        params["with_date"] = time_range
 
     async with httpx.AsyncClient(
         headers=_search_headers(),
@@ -557,6 +598,7 @@ async def search_bing(
     query: str,
     max_results: int = 10,
     language: str | None = None,
+    time_range: str | None = None,
 ) -> list[SearchResult]:
     """Search via Bing (uses <cite> for actual URLs, bypasses redirect tracking)."""
     params: dict[str, str] = {"q": query}
@@ -565,6 +607,8 @@ async def search_bing(
         params["setlang"] = language
     else:
         params["mkt"] = "en-US"
+    if time_range and time_range in BING_FRESHNESS_MAP:
+        params["filters"] = f'ex1:"{BING_FRESHNESS_MAP[time_range]}"'
 
     async with httpx.AsyncClient(
         headers=_search_headers(),
@@ -622,7 +666,7 @@ async def search_bing(
 
 
 # ---------------------------------------------------------------------------
-# Parallel search — race DDG + Mojeek + Qwant
+# Parallel search — race DDG + Mojeek + Bing + Startpage
 # ---------------------------------------------------------------------------
 
 async def _parallel_search(
@@ -634,8 +678,8 @@ async def _parallel_search(
     """Race DDG Lite, Mojeek, Bing, and Startpage in parallel; return first that produces results."""
     ddg_task = asyncio.create_task(search_ddg_lite(query, max_results, time_range, language))
     mojeek_task = asyncio.create_task(search_mojeek(query, max_results, language))
-    bing_task = asyncio.create_task(search_bing(query, max_results, language))
-    startpage_task = asyncio.create_task(search_startpage(query, max_results))
+    bing_task = asyncio.create_task(search_bing(query, max_results, language, time_range))
+    startpage_task = asyncio.create_task(search_startpage(query, max_results, time_range))
 
     pending = {ddg_task, mojeek_task, bing_task, startpage_task}
 
@@ -666,26 +710,61 @@ async def get_related_searches(
     query: str,
     max_suggestions: int = 10,
 ) -> list[str]:
-    """Get related search queries from DDG autocomplete."""
-    async with httpx.AsyncClient(
-        headers=_search_headers(),
-        timeout=httpx.Timeout(8.0, connect=5.0),
-        http1=True,
-    ) as ddg:
-        resp = await _retry_async(
-            ddg.get, retries=1,
-            url="https://duckduckgo.com/ac/",
-            params={"q": query, "type": "list"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], list):
-            suggestions = data[1]
-        elif isinstance(data, list) and data and isinstance(data[0], dict):
-            suggestions = [item.get("phrase", "") for item in data]
-        else:
-            suggestions = data if isinstance(data, list) else []
-        return [s.strip() for s in suggestions if isinstance(s, str) and s.strip()][:max_suggestions]
+    """Get related search queries from DDG autocomplete, with Bing Suggest fallback."""
+
+    async def _ddg_suggest() -> list[str]:
+        async with httpx.AsyncClient(
+            headers=_search_headers(),
+            timeout=httpx.Timeout(8.0, connect=5.0),
+            http1=True,
+        ) as ddg:
+            resp = await _retry_async(
+                ddg.get, retries=1,
+                url="https://duckduckgo.com/ac/",
+                params={"q": query, "type": "list"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], list):
+                suggestions = data[1]
+            elif isinstance(data, list) and data and isinstance(data[0], dict):
+                suggestions = [item.get("phrase", "") for item in data]
+            else:
+                suggestions = data if isinstance(data, list) else []
+            return [s.strip() for s in suggestions if isinstance(s, str) and s.strip()][:max_suggestions]
+
+    async def _bing_suggest() -> list[str]:
+        async with httpx.AsyncClient(
+            headers=_search_headers(),
+            timeout=httpx.Timeout(8.0, connect=5.0),
+            http1=True,
+        ) as client:
+            resp = await _retry_async(
+                client.get, retries=1,
+                url="https://www.bing.com/osjson.aspx",
+                params={"query": query},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], list):
+                return [s.strip() for s in data[1] if isinstance(s, str) and s.strip()][:max_suggestions]
+            return []
+
+    try:
+        results = await _ddg_suggest()
+        if results:
+            return results
+    except Exception as exc:
+        logger.warning("DDG autocomplete failed, trying Bing fallback: %s", exc)
+
+    try:
+        results = await _bing_suggest()
+        if results:
+            return results
+    except Exception as exc:
+        logger.warning("Bing suggest also failed: %s", exc)
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -693,19 +772,41 @@ async def get_related_searches(
 # ---------------------------------------------------------------------------
 
 async def get_instant_answer(query: str) -> dict[str, Any]:
-    """Fetch structured answer from DDG Instant Answer API."""
-    async with httpx.AsyncClient(
-        headers=_search_headers(),
-        timeout=httpx.Timeout(8.0, connect=5.0),
-        http1=True,
-    ) as client:
-        resp = await _retry_async(
-            client.get, retries=1,
-            url="https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "0"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+    """Fetch structured answer from DDG Instant Answer API, with Wikipedia fallback."""
+    try:
+        async with httpx.AsyncClient(
+            headers=_search_headers(),
+            timeout=httpx.Timeout(8.0, connect=5.0),
+            http1=True,
+        ) as client:
+            resp = await _retry_async(
+                client.get, retries=1,
+                url="https://api.duckduckgo.com/",
+                params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "0"},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning("DDG Instant Answer failed, trying Wikipedia fallback: %s", exc)
+
+    # Wikipedia fallback: extract topic from query and look up Wikipedia
+    wiki_query = _extract_wiki_query(query)
+    if wiki_query:
+        try:
+            wiki_data = await get_wiki_summary(wiki_query)
+            if wiki_data and wiki_data.get("extract"):
+                # Format Wikipedia data to match DDG Instant Answer structure
+                return {
+                    "Abstract": wiki_data.get("extract", ""),
+                    "AbstractSource": "Wikipedia",
+                    "AbstractURL": wiki_data.get("content_urls", {}).get("desktop", {}).get("page", ""),
+                    "Heading": wiki_data.get("title", query),
+                }
+        except Exception as exc:
+            logger.warning("Wikipedia fallback also failed: %s", exc)
+
+    # Return empty DDG-style response so format_instant_answer handles gracefully
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -967,7 +1068,7 @@ def format_search_results(results: list[SearchResult], query: str, tool_name: st
     source_labels = {"duckduckgo": "DuckDuckGo", "mojeek": "Mojeek", "bing": "Bing", "startpage": "Startpage"}
     source_label = source_labels.get(source, source)
 
-    lines = [f"## {tool_name}: {query}\n"]
+    lines = [f"## {tool_name}: {query} ({len(results)} results)\n"]
     lines.append(f"*Source: {source_label}*\n")
 
     for i, r in enumerate(results, 1):
@@ -1227,7 +1328,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="4.1.0")
+server = Server("free-web-search", version="4.2.0")
 
 
 @server.list_tools()
@@ -1526,15 +1627,24 @@ async def call_tool(name: str, arguments: dict[str, Any]):
             exclude_domains = arguments.get("exclude_domains")
 
             try:
-                results = await _parallel_search(query, max_results, time_range, language)
+                # Parse site: operators from query
+                clean_query, site_domains = _parse_site_operator(query)
+                # Merge site: domains with explicit include_domains
+                if site_domains:
+                    if include_domains:
+                        include_domains = list(set(include_domains) | set(site_domains))
+                    else:
+                        include_domains = site_domains
+
+                results = await _parallel_search(clean_query, max_results, time_range, language)
                 results = post_process_results(results)
                 results = _apply_domain_filter(results, include_domains, exclude_domains)
                 if not results:
                     return error_result(
-                        f"No results found for: {query}. "
+                        f"No results found for: {clean_query}. "
                         "Try rephrasing, simplifying the query, or removing domain filters."
                     )
-                return [TextContent(type="text", text=format_search_results(results, query, "web_search"))]
+                return [TextContent(type="text", text=format_search_results(results, clean_query, "web_search"))]
             except Exception as e:
                 return error_result(f"Search error: {e}")
 
@@ -1550,15 +1660,24 @@ async def call_tool(name: str, arguments: dict[str, Any]):
             exclude_domains = arguments.get("exclude_domains")
 
             try:
-                results = await _parallel_search(query, max_results, time_range, language)
+                # Parse site: operators from query
+                clean_query, site_domains = _parse_site_operator(query)
+                # Merge site: domains with explicit include_domains
+                if site_domains:
+                    if include_domains:
+                        include_domains = list(set(include_domains) | set(site_domains))
+                    else:
+                        include_domains = site_domains
+
+                results = await _parallel_search(clean_query, max_results, time_range, language)
                 results = post_process_results(results)
                 results = _apply_domain_filter(results, include_domains, exclude_domains)
                 if not results:
                     return error_result(
-                        f"No results found for: {query}. "
+                        f"No results found for: {clean_query}. "
                         "Try rephrasing, simplifying the query, or removing domain filters."
                     )
-                return [TextContent(type="text", text=format_search_results(results, query, "news_search"))]
+                return [TextContent(type="text", text=format_search_results(results, clean_query, "news_search"))]
             except Exception as e:
                 return error_result(f"News search error: {e}")
 
@@ -1663,21 +1782,41 @@ async def call_tool(name: str, arguments: dict[str, Any]):
 
             try:
                 # Fire all three sources in parallel
+                wiki_query = _extract_wiki_query(query)
                 instant_task = asyncio.create_task(get_instant_answer(query))
-                wiki_task = asyncio.create_task(get_wiki_summary(query))
+                wiki_task = asyncio.create_task(get_wiki_summary(wiki_query))
                 search_task = asyncio.create_task(
                     _parallel_search(query, 5, language="en")
                 )
 
-                instant_data = await instant_task
-                wiki_data = await wiki_task
-                search_results = await search_task
+                # Use return_exceptions=True so DDG failure doesn't kill the whole call
+                gathered = await asyncio.gather(
+                    instant_task, wiki_task, search_task, return_exceptions=True
+                )
+
+                instant_data = {}
+                if isinstance(gathered[0], dict):
+                    instant_data = gathered[0]
+                elif isinstance(gathered[0], Exception):
+                    logger.warning("auto_answer: instant_answer failed: %s", gathered[0])
+
+                wiki_data = {}
+                if isinstance(gathered[1], dict):
+                    wiki_data = gathered[1]
+                elif isinstance(gathered[1], Exception):
+                    logger.warning("auto_answer: wiki_summary failed: %s", gathered[1])
+
+                search_results = []
+                if isinstance(gathered[2], list):
+                    search_results = gathered[2]
+                elif isinstance(gathered[2], Exception):
+                    logger.warning("auto_answer: search failed: %s", gathered[2])
 
                 # Post-process search results
                 search_results = post_process_results(search_results)
 
                 return [TextContent(type="text", text=format_auto_answer(
-                    query, instant_data, wiki_data, search_results, query
+                    query, instant_data, wiki_data, search_results, wiki_query
                 ))]
             except Exception as e:
                 return error_result(f"Auto answer error: {e}")
