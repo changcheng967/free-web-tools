@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "free-web-tools"
+version = "4.0.0"
+description = "Free MCP server for web search and content extraction. Zero cost, no API keys."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx[http2]>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "trafilatura>=1.8.0",
+]
+
+[project.scripts]
+free-web-search = "mcp_server:main"
