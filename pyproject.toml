@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "free-web-tools"
-version = "4.0.0"
+version = "4.1.0"
 description = "Free MCP server for web search and content extraction. Zero cost, no API keys."
 readme = "README.md"
 requires-python = ">=3.10"
