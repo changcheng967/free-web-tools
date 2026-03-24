@@ -27,14 +27,14 @@ claude mcp add free-web-search -- python -m mcp_server
 
 | Tool | Purpose | Backend |
 |------|---------|---------|
-| `web_search` | General web search with time-range, language, domain filtering | DDG + Mojeek + Qwant (parallel) |
-| `news_search` | News search (default time_range=week) | DDG + Mojeek + Qwant (parallel) |
+| `web_search` | General web search with time-range, language, domain filtering | DDG + Mojeek + Bing + Startpage (parallel) |
+| `news_search` | News search (default time_range=week) | DDG + Mojeek + Bing + Startpage (parallel) |
 | `fetch_url` | Extract content from URL with metadata, format options, links | Jina Reader JSON -> trafilatura |
 | `deep_search` | Search + full content from top results (research tool) | Parallel search + parallel fetch |
-| `instant_answer` | Factual/definitional answers (infobox, key facts) | DDG Instant Answer API |
+| `instant_answer` | Factual/definitional answers (infobox, key facts) | DDG Instant Answer API + Wikipedia fallback |
 | `wiki_summary` | Wikipedia article summary (all languages) | Wikipedia REST API |
-| `auto_answer` | Comprehensive answer from multiple sources at once | DDG + Wikipedia + web search (parallel) |
-| `related_searches` | Related/expanded query suggestions | DDG autocomplete |
+| `auto_answer` | Comprehensive answer from multiple sources at once | DDG + Wikipedia + web search (parallel, fault-tolerant) |
+| `related_searches` | Related/expanded query suggestions | DDG autocomplete + Bing Suggest fallback |
 
 ### Tool Details
 
@@ -56,10 +56,10 @@ claude mcp add free-web-search -- python -m mcp_server
 
 ## Architecture
 
-- **Search**: DuckDuckGo Lite + Mojeek + Qwant (3-way parallel race, first-wins)
-- **Answer engine**: DuckDuckGo Instant Answer API (structured factual data)
+- **Search**: DuckDuckGo Lite + Mojeek + Bing + Startpage (4-way parallel race, first-wins)
+- **Answer engine**: DuckDuckGo Instant Answer API + Wikipedia fallback (structured factual data)
 - **Encyclopedia**: Wikipedia REST Summary API (all languages)
-- **Comprehensive**: `auto_answer` combines instant answer + Wikipedia + web search
+- **Comprehensive**: `auto_answer` combines instant answer + Wikipedia + web search (fault-tolerant)
 - **Content extraction**: Jina AI Reader JSON (with format/links options) -> trafilatura `bare_extraction()` -> BeautifulSoup
 - **Reliability**: Retry with exponential backoff (callable factory, not coroutine), parallel backend racing
 - **Quality**: URL normalization (30+ tracking params), domain dedup, snippet capping, title cleaning, subdomain-aware filtering, smart truncation
