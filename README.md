@@ -1,6 +1,6 @@
 # Free Web Search MCP Server
 
-Zero-cost web search and content extraction via MCP protocol. No API keys, no accounts, no limits.
+Zero-cost web search, content extraction, and developer tools via MCP protocol. No API keys, no accounts, no limit.
 
 ## Setup
 
@@ -23,7 +23,7 @@ claude mcp add free-web-search -- python -m mcp_server
 # }
 ```
 
-## Tools (8)
+## Tools (14)
 
 | Tool | Purpose | Backend |
 |------|---------|---------|
@@ -35,6 +35,12 @@ claude mcp add free-web-search -- python -m mcp_server
 | `wiki_summary` | Wikipedia article summary (all languages) | Wikipedia REST API |
 | `auto_answer` | Comprehensive answer from multiple sources at once | DDG + Wikipedia + web search (parallel, fault-tolerant) |
 | `related_searches` | Related/expanded query suggestions | DDG autocomplete + Bing Suggest fallback |
+| `github_repo_info` | GitHub repo README + metadata (stars, language, license) | GitHub REST API + raw.githubusercontent.com |
+| `github_file_content` | Fetch specific file content from GitHub repo | raw.githubusercontent.com (unlimited) |
+| `github_search_repos` | Search GitHub for repositories | GitHub Search API |
+| `github_issues` | List/fetch GitHub issues and pull requests | GitHub Issues/Search API |
+| `code_search` | Search code across GitHub repos (grep.app) | grep.app API (free, unlimited) |
+| `package_info` | Package metadata from PyPI, npm, crates.io | Registry JSON APIs |
 
 ### Tool Details
 
@@ -42,17 +48,29 @@ claude mcp add free-web-search -- python -m mcp_server
 
 **`news_search`** — Like `web_search` but defaults to `time_range="week"`.
 
-**`fetch_url`** — Extract content from any URL. Returns Markdown (or plain text) with metadata header (Title | Author | Site | Date | Language | Method). Optional `with_links=true` appends all hyperlinks found on the page. Optional `return_format="text"` for plain text output.
+**`fetch_url`** — Extract content from any URL. Returns Markdown (or plain text) with metadata header (Title | Author | Site | Date | Language | Method). Optional `with_links=true` appends all hyperlinks found on the page.
 
-**`deep_search`** — One-shot research: searches the web, fetches full content from top 3 results in parallel. Returns combined Markdown with numbered references. Now supports `time_range` and `language` params.
+**`deep_search`** — One-shot research: searches the web, fetches full content from top 3 results in parallel. Returns combined Markdown with numbered references.
 
-**`instant_answer`** — Best for factual queries ("What is X?", "Capital of Y?"). Returns summary, answer, key facts (infobox), definition. Shows related topics and actionable suggestions when no direct answer is found.
+**`instant_answer`** — Best for factual queries ("What is X?", "Capital of Y?"). Returns summary, answer, key facts (infobox), definition.
 
-**`wiki_summary`** — Best for encyclopedic topics. Supports all Wikipedia languages via `lang` param (e.g. `lang="de"`, `lang="zh"`). Returns extract, description, thumbnail, and timestamp.
+**`wiki_summary`** — Best for encyclopedic topics. Supports all Wikipedia languages via `lang` param.
 
-**`auto_answer`** — Comprehensive answer engine: fires DDG Instant Answer, Wikipedia, and web search in parallel. Synthesizes a combined answer with key facts and web references. Best for complex questions that benefit from multiple sources.
+**`auto_answer`** — Comprehensive answer engine: fires DDG Instant Answer, Wikipedia, and web search in parallel.
 
 **`related_searches`** — Get related/expanded query suggestions.
+
+**`github_repo_info`** — Fetch a GitHub repository's README and structured metadata (stars, forks, language, license, topics, last push date). Supports `owner` + `repo` params.
+
+**`github_file_content`** — Fetch a specific file from a GitHub repository. Returns raw file content. Supports branch selection and auto-detects default branch. Rejects binary files.
+
+**`github_search_repos`** — Search GitHub for repositories. Supports GitHub search syntax (language, stars, topics). Sort by stars, forks, or recently updated.
+
+**`github_issues`** — List, search, or fetch individual GitHub issues and pull requests. Filter by state (open/closed), type (issue/PR), search text. Fetch specific issue by number with full details and comments.
+
+**`code_search`** — Search code across open-source GitHub repositories. Powered by grep.app (free, no API key). Supports language and repo filters.
+
+**`package_info`** — Look up package metadata from PyPI, npm, or crates.io. Returns version, description, dependencies, license, and links.
 
 ## Architecture
 
@@ -60,8 +78,11 @@ claude mcp add free-web-search -- python -m mcp_server
 - **Answer engine**: DuckDuckGo Instant Answer API + Wikipedia fallback (structured factual data)
 - **Encyclopedia**: Wikipedia REST Summary API (all languages)
 - **Comprehensive**: `auto_answer` combines instant answer + Wikipedia + web search (fault-tolerant)
-- **Content extraction**: Jina AI Reader JSON (with format/links options) -> trafilatura `bare_extraction()` -> BeautifulSoup
-- **Reliability**: Retry with exponential backoff (callable factory, not coroutine), parallel backend racing
+- **GitHub**: REST API (60 req/hr) + raw.githubusercontent.com (unlimited) for repo info, file content, issues/PRs, repo search
+- **Code search**: grep.app API (free, unlimited) for cross-repo code search
+- **Package registries**: PyPI JSON + npm Registry + crates.io API (all free, no keys)
+- **Content extraction**: Jina AI Reader JSON (with format/links options) -> trafilatura bare_extraction() -> BeautifulSoup
+- **Reliability**: Retry with exponential backoff, parallel backend racing, fallback chains
 - **Quality**: URL normalization (30+ tracking params), domain dedup, snippet capping, title cleaning, subdomain-aware filtering, smart truncation
 - **Performance**: Persistent HTTP/2 client, parallel search backends, parallel content fetch
 - **Protocol**: MCP spec via official Python SDK, STDIO transport

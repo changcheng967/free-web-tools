@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v4.2.0.
+"""Free Web Search MCP Server v5.0.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -975,6 +975,694 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
 
 
 # ---------------------------------------------------------------------------
+# GitHub REST API helper
+# ---------------------------------------------------------------------------
+
+_GITHUB_API_HEADERS = {
+    "Accept": "application/vnd.github.v3+json",
+    "User-Agent": "free-web-tools-mcp/5.0.0",
+}
+
+
+async def _github_api_get(path: str) -> dict | list | None:
+    """GET from GitHub REST API. Returns JSON on success, None on failure."""
+    client = _get_shared_client()
+    try:
+        url = f"https://api.github.com{path}"
+        resp = await client.get(url, headers=_GITHUB_API_HEADERS, timeout=10.0)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning("GitHub API %s returned %d", path, resp.status_code)
+    except Exception as exc:
+        logger.warning("GitHub API request failed for %s: %s", path, exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# GitHub — repo info
+# ---------------------------------------------------------------------------
+
+async def github_repo_info(
+    owner: str,
+    repo: str,
+    include_readme: bool = True,
+) -> str:
+    """Fetch repo metadata + optional README from GitHub."""
+    client = _get_shared_client()
+
+    # Fetch repo metadata via API
+    repo_data = await _github_api_get(f"/repos/{owner}/{repo}")
+    if not repo_data:
+        raise RuntimeError(f"Repository not found: {owner}/{repo}")
+
+    default_branch = repo_data.get("default_branch", "main")
+
+    # Fetch README
+    readme = ""
+    if include_readme:
+        for name in ["README.md", "README.rst", "README.txt", "README", "readme.md"]:
+            for br in [default_branch, "main", "master"]:
+                url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/{name}"
+                try:
+                    resp = await client.get(url, timeout=10.0, follow_redirects=True)
+                    if resp.status_code == 200 and len(resp.text) > 10:
+                        readme = resp.text
+                        break
+                except Exception:
+                    continue
+            if readme:
+                break
+
+    return _format_github_repo(repo_data, readme)
+
+
+# ---------------------------------------------------------------------------
+# GitHub — file content
+# ---------------------------------------------------------------------------
+
+_BINARY_EXTENSIONS = frozenset([
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx",
+    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
+    ".so", ".dll", ".dylib", ".exe", ".bin", ".dat",
+    ".pyc", ".pyd", ".o", ".a", ".lib",
+])
+
+
+async def github_file_content(
+    owner: str,
+    repo: str,
+    path: str,
+    branch: str | None = None,
+    max_length: int = 15000,
+) -> str:
+    """Fetch a specific file from a GitHub repository via raw.githubusercontent.com."""
+    # Check for binary files
+    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext in _BINARY_EXTENSIONS:
+        raise RuntimeError(f"Binary file not supported: {path}")
+
+    client = _get_shared_client()
+
+    # Determine branch
+    if not branch:
+        repo_data = await _github_api_get(f"/repos/{owner}/{repo}")
+        branch = repo_data.get("default_branch", "main") if repo_data else "main"
+
+    # Fetch from raw.githubusercontent.com (no rate limit)
+    encoded_path = urllib.parse.quote(path, safe="/")
+    for br in [branch, "main", "master"]:
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/{encoded_path}"
+        try:
+            resp = await client.get(url, timeout=15.0, follow_redirects=True)
+            if resp.status_code == 200:
+                content = resp.text
+                actual_branch = br
+                break
+        except Exception:
+            continue
+    else:
+        raise RuntimeError(f"File not found: {owner}/{repo}/{path} (tried branches: {branch}, main, master)")
+
+    # Truncate if needed
+    if len(content) > max_length:
+        content = _smart_truncate(content, max_length)
+
+    return _format_github_file(owner, repo, path, content, actual_branch)
+
+
+# ---------------------------------------------------------------------------
+# GitHub — search repos
+# ---------------------------------------------------------------------------
+
+async def github_search_repos(
+    query: str,
+    language: str | None = None,
+    sort: str = "stars",
+    max_results: int = 10,
+    min_stars: int | None = None,
+) -> str:
+    """Search GitHub for repositories."""
+    # Build query
+    parts = [query]
+    if language:
+        parts.append(f"language:{language}")
+    if min_stars:
+        parts.append(f"stars:>={min_stars}")
+    q = " ".join(parts)
+
+    encoded_q = urllib.parse.quote(q, safe="")
+    path = f"/search/repositories?q={encoded_q}&sort={sort}&order=desc&per_page={max_results}"
+    data = await _github_api_get(path)
+
+    if not data or not data.get("items"):
+        return f"## github_search_repos: {query}\n\nNo repositories found."
+
+    return _format_github_search_repos(data["items"][:max_results], query, data.get("total_count", 0), language)
+
+
+# ---------------------------------------------------------------------------
+# GitHub — issues / PRs
+# ---------------------------------------------------------------------------
+
+async def github_issues(
+    owner: str,
+    repo: str,
+    issue_number: int | None = None,
+    state: str = "open",
+    issue_type: str = "issue",
+    search: str = "",
+    sort: str = "updated",
+    max_results: int = 10,
+) -> str:
+    """List or fetch GitHub issues / PRs."""
+    if issue_number is not None:
+        return await _github_single_issue(owner, repo, issue_number)
+
+    # List / search issues
+    if search:
+        q = f"repo:{owner}/{repo} is:{issue_type} is:{state} {search}"
+        encoded_q = urllib.parse.quote(q, safe="")
+        path = f"/search/issues?q={encoded_q}&sort={sort}&order=desc&per_page={max_results}"
+        data = await _github_api_get(path)
+    else:
+        path = f"/repos/{owner}/{repo}/issues?state={state}&sort={sort}&direction=desc&per_page={max_results}"
+        data = await _github_api_get(path)
+
+    if not data:
+        return f"## github_issues: {owner}/{repo}\n\nNo issues found."
+
+    items = data.get("items", data) if isinstance(data, dict) else data
+    if not items:
+        return f"## github_issues: {owner}/{repo}\n\nNo issues found."
+
+    # Filter by type if needed (GitHub API returns both issues and PRs)
+    if issue_type == "pr":
+        items = [i for i in items if i.get("pull_request")]
+    elif issue_type == "issue":
+        items = [i for i in items if not i.get("pull_request")]
+
+    return _format_github_issues_list(items[:max_results], owner, repo, state, issue_type)
+
+
+async def _github_single_issue(owner: str, repo: str, number: int) -> str:
+    """Fetch a single issue or PR with details and comments."""
+    issue = await _github_api_get(f"/repos/{owner}/{repo}/issues/{number}")
+    if not issue:
+        raise RuntimeError(f"Issue/PR not found: {owner}/{repo}#{number}")
+
+    is_pr = "pull_request" in issue
+    pr_data = None
+    if is_pr:
+        pr_data = await _github_api_get(f"/repos/{owner}/{repo}/pulls/{number}")
+
+    # Fetch comments (up to 10)
+    comments_text = ""
+    comment_count = issue.get("comments", 0)
+    if comment_count > 0:
+        comments = await _github_api_get(f"/repos/{owner}/{repo}/issues/{number}/comments")
+        if isinstance(comments, list):
+            parts = []
+            for c in comments[:10]:
+                user = c.get("user", {}).get("login", "unknown")
+                body = (c.get("body") or "")[:500]
+                if body:
+                    parts.append(f"**@{user}:**\n{body}")
+            comments_text = "\n\n---\n\n".join(parts)
+
+    return _format_github_issue_detail(issue, pr_data, comments_text)
+
+
+# ---------------------------------------------------------------------------
+# Code search — grep.app
+# ---------------------------------------------------------------------------
+
+async def code_search(
+    query: str,
+    language: str | None = None,
+    repo: str | None = None,
+    max_results: int = 10,
+) -> str:
+    """Search code across GitHub via grep.app API (free, no key)."""
+    client = _get_shared_client()
+    params: dict[str, str] = {"q": query}
+    if language:
+        params["filter[lang][0]"] = language
+    if repo:
+        params["filter[repo][0]"] = repo
+
+    try:
+        resp = await client.get(
+            "https://grep.app/api/search",
+            params=params,
+            timeout=12.0,
+            headers={"User-Agent": "free-web-tools-mcp/5.0.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Code search failed: {exc}")
+
+    hits = data.get("hits", {})
+    items = hits.get("hits", [])
+    total = hits.get("total", 0)
+
+    if not items:
+        return f"## code_search: {query}\n\nNo code results found."
+
+    return _format_code_search(items[:max_results], query, total, language)
+
+
+# ---------------------------------------------------------------------------
+# Package info — PyPI / npm / crates.io
+# ---------------------------------------------------------------------------
+
+async def package_info(
+    name: str,
+    registry: str = "pypi",
+    version: str | None = None,
+) -> str:
+    """Fetch package metadata from PyPI, npm, or crates.io."""
+    client = _get_shared_client()
+
+    if registry == "pypi":
+        return await _fetch_pypi(client, name, version)
+    elif registry == "npm":
+        return await _fetch_npm(client, name, version)
+    elif registry == "crates":
+        return await _fetch_crates(client, name)
+    else:
+        raise RuntimeError(f"Unknown registry: {registry}. Use 'pypi', 'npm', or 'crates'.")
+
+
+async def _fetch_pypi(client: httpx.AsyncClient, name: str, version: str | None = None) -> str:
+    """Fetch package info from PyPI JSON API."""
+    if version:
+        url = f"https://pypi.org/pypi/{name}/{version}/json"
+    else:
+        url = f"https://pypi.org/pypi/{name}/json"
+    try:
+        resp = await client.get(url, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 404:
+            raise RuntimeError(f"Package '{name}' not found on PyPI")
+        resp.raise_for_status()
+        data = resp.json()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"PyPI lookup failed for '{name}': {exc}")
+
+    info = data.get("info", {})
+    return _format_pypi(info, name)
+
+
+async def _fetch_npm(client: httpx.AsyncClient, name: str, version: str | None = None) -> str:
+    """Fetch package info from npm registry."""
+    try:
+        resp = await client.get(
+            f"https://registry.npmjs.org/{name}",
+            timeout=10.0,
+            follow_redirects=True,
+        )
+        if resp.status_code == 404:
+            raise RuntimeError(f"Package '{name}' not found on npm")
+        resp.raise_for_status()
+        data = resp.json()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"npm lookup failed for '{name}': {exc}")
+
+    return _format_npm(data, name, version)
+
+
+async def _fetch_crates(client: httpx.AsyncClient, name: str) -> str:
+    """Fetch crate info from crates.io API."""
+    try:
+        resp = await client.get(
+            f"https://crates.io/api/v1/crates/{name}",
+            timeout=10.0,
+            headers={"User-Agent": "free-web-tools-mcp/5.0.0"},
+        )
+        if resp.status_code == 404:
+            raise RuntimeError(f"Crate '{name}' not found on crates.io")
+        resp.raise_for_status()
+        data = resp.json()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"crates.io lookup failed for '{name}': {exc}")
+
+    crate = data.get("crate", {})
+    return _format_crates(crate, name)
+
+
+# ---------------------------------------------------------------------------
+# Format helpers for new tools
+# ---------------------------------------------------------------------------
+
+def _human_count(n: int) -> str:
+    """Format large numbers: 69200 -> '69.2k'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _format_github_repo(repo_data: dict, readme: str) -> str:
+    """Format GitHub repo info as Markdown."""
+    full_name = repo_data.get("full_name", "")
+    parts = [f"## github_repo_info: {full_name}\n"]
+
+    desc = repo_data.get("description", "")
+    if desc:
+        parts.append(f"**{desc}**\n")
+
+    # Metadata line
+    meta = []
+    if repo_data.get("language"):
+        meta.append(repo_data["language"])
+    if repo_data.get("stargazers_count") is not None:
+        meta.append(f"★ {_human_count(repo_data['stargazers_count'])}")
+    if repo_data.get("forks_count") is not None:
+        meta.append(f"⑂ {_human_count(repo_data['forks_count'])}")
+    if repo_data.get("open_issues_count") is not None:
+        meta.append(f"Issues: {repo_data['open_issues_count']:,}")
+    if repo_data.get("license", {}).get("spdx_id") and repo_data["license"]["spdx_id"] != "NOASSERTION":
+        meta.append(f"License: {repo_data['license']['spdx_id']}")
+    if repo_data.get("default_branch"):
+        meta.append(f"Branch: {repo_data['default_branch']}")
+    if repo_data.get("pushed_at"):
+        meta.append(f"Last push: {repo_data['pushed_at'][:10]}")
+
+    if meta:
+        parts.append("*" + " | ".join(meta) + "*\n")
+
+    # Topics
+    topics = repo_data.get("topics", [])
+    if topics:
+        parts.append(f"**Topics:** {', '.join(topics)}\n")
+
+    # Links
+    if repo_data.get("html_url"):
+        parts.append(f"**URL:** {repo_data['html_url']}")
+    if repo_data.get("homepage") and repo_data["homepage"].startswith("http"):
+        parts.append(f"**Homepage:** {repo_data['homepage']}")
+
+    # README
+    if readme:
+        truncated = _smart_truncate(readme, 10000)
+        parts.append(f"\n### README\n")
+        parts.append(truncated)
+    else:
+        parts.append("\n*No README found.*")
+
+    return "\n".join(parts)
+
+
+def _format_github_file(owner: str, repo: str, path: str, content: str, branch: str) -> str:
+    """Format GitHub file content as Markdown."""
+    parts = [f"## github_file_content: {owner}/{repo}/{path}\n"]
+    url = f"https://github.com/{owner}/{repo}/blob/{branch}/{path}"
+    parts.append(f"*Branch: {branch} | URL: {url}*\n")
+    parts.append(content)
+    return "\n".join(parts)
+
+
+def _format_github_search_repos(items: list[dict], query: str, total: int, language: str | None) -> str:
+    """Format GitHub repo search results."""
+    parts = [f"## github_search_repos: {query}\n"]
+    lang_suffix = f" ({language})" if language else ""
+    parts.append(f"*{_human_count(total)} results{lang_suffix}*\n")
+
+    for i, item in enumerate(items, 1):
+        full_name = item.get("full_name", "")
+        desc = item.get("description", "")
+        stars = item.get("stargazers_count", 0)
+        lang = item.get("language", "")
+        url = item.get("html_url", "")
+
+        parts.append(f"**[{i}] [{full_name}]({url})**")
+        meta = []
+        if lang:
+            meta.append(lang)
+        meta.append(f"★ {_human_count(stars)}")
+        license_name = item.get("license", {}).get("spdx_id", "")
+        if license_name and license_name != "NOASSERTION":
+            meta.append(license_name)
+        if item.get("archived"):
+            meta.append("ARCHIVED")
+        parts.append(f"*{' | '.join(meta)}*")
+        if desc:
+            parts.append(f"> {desc[:200]}")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def _format_github_issues_list(items: list[dict], owner: str, repo: str, state: str, issue_type: str) -> str:
+    """Format GitHub issues/PRs list."""
+    parts = [f"## github_issues: {owner}/{repo} ({state} {issue_type}s)\n"]
+
+    for i, item in enumerate(items, 1):
+        number = item.get("number", "")
+        title = item.get("title", "")
+        html_url = item.get("html_url", "")
+        is_pr = "pull_request" in item
+        type_label = "PR" if is_pr else "Issue"
+        user = item.get("user", {}).get("login", "")
+        labels = ", ".join(l["name"] for l in item.get("labels", []) if l.get("name"))
+        comments = item.get("comments", 0)
+        created = item.get("created_at", "")[:10]
+
+        parts.append(f"**[#{number}] [{title}]({html_url})** ({type_label})")
+        meta = [f"by @{user}" if user else "", created]
+        if labels:
+            meta.append(f"Labels: {labels}")
+        meta.append(f"Comments: {comments}")
+        parts.append(f"*{' | '.join(m for m in meta if m)}*")
+
+        body = (item.get("body") or "")[:150]
+        if body:
+            parts.append(f"> {body}...")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def _format_github_issue_detail(issue: dict, pr_data: dict | None, comments: str) -> str:
+    """Format a single GitHub issue/PR with full details."""
+    number = issue.get("number", "")
+    title = issue.get("title", "")
+    is_pr = "pull_request" in issue
+    type_label = "PR" if is_pr else "Issue"
+
+    parts = [f"## github_issues: #{number} {title}\n"]
+
+    # Metadata
+    meta = []
+    state = issue.get("state", "")
+    meta.append(f"State: {state}")
+    if issue.get("user", {}).get("login"):
+        meta.append(f"Author: @{issue['user']['login']}")
+    meta.append(f"Created: {issue.get('created_at', '')[:10]}")
+    labels = ", ".join(l["name"] for l in issue.get("labels", []) if l.get("name"))
+    if labels:
+        meta.append(f"Labels: {labels}")
+    if issue.get("assignees"):
+        assignees = ", ".join("@" + a["login"] for a in issue["assignees"] if a.get("login"))
+        if assignees:
+            meta.append(f"Assignees: {assignees}")
+    if issue.get("milestone", {}).get("title"):
+        meta.append(f"Milestone: {issue['milestone']['title']}")
+
+    if pr_data:
+        if pr_data.get("merged"):
+            meta.append("Merged: Yes")
+        if pr_data.get("additions") is not None:
+            meta.append(f"+{pr_data['additions']}/-{pr_data['deletions']} ({pr_data.get('changed_files', '?')} files)")
+
+    parts.append(f"**{type_label}** " + "* | ".join(meta) + "*\n")
+
+    # Body
+    body = issue.get("body", "")
+    if body:
+        parts.append(body[:5000])
+        if len(body) > 5000:
+            parts.append("\n*[Body truncated]*")
+
+    # URL
+    if issue.get("html_url"):
+        parts.append(f"\n*{issue['html_url']}*")
+
+    # Comments
+    if comments:
+        parts.append(f"\n### Comments\n")
+        parts.append(comments)
+
+    return "\n".join(parts)
+
+
+def _format_code_search(items: list[dict], query: str, total: int, language: str | None) -> str:
+    """Format grep.app code search results."""
+    lang_suffix = f" ({language})" if language else ""
+    parts = [f"## code_search: {query}{lang_suffix}\n"]
+    parts.append(f"*{_human_count(total)} results across GitHub*\n")
+
+    for i, item in enumerate(items, 1):
+        repo_info = item.get("repo", {})
+        repo_name = repo_info.get("raw", "") if isinstance(repo_info, dict) else str(repo_info)
+        path = item.get("path", {}).get("raw", "") if isinstance(item.get("path"), dict) else item.get("path", "")
+        branch = item.get("branch", "main")
+
+        # Content snippet
+        content = item.get("content", "")
+        if isinstance(content, dict):
+            content = content.get("raw", "")
+        snippet = content[:600] if content else ""
+
+        url = f"https://github.com/{repo_name}/blob/{branch}/{path}"
+
+        parts.append(f"**[{i}] [{repo_name}]({url})** — `{path}`")
+        if snippet:
+            parts.append(f"```\n{snippet}\n```")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def _format_pypi(info: dict, name: str) -> str:
+    """Format PyPI package info."""
+    parts = [f"## package_info: {name} (PyPI)\n"]
+
+    # Core info
+    if info.get("summary"):
+        parts.append(f"**{info['summary']}**\n")
+
+    meta = []
+    if info.get("version"):
+        meta.append(f"Latest: {info['version']}")
+    if info.get("license"):
+        meta.append(f"License: {info['license']}")
+    if info.get("author"):
+        meta.append(f"Author: {info['author']}")
+    requires_python = info.get("requires_python", "")
+    if requires_python:
+        meta.append(f"Python: {requires_python}")
+    if meta:
+        parts.append("*" + " | ".join(meta) + "*\n")
+
+    # Links
+    links = []
+    if info.get("home_page"):
+        links.append(f"Homepage: {info['home_page']}")
+    if info.get("project_url"):
+        # project_url can be a string or list
+        urls = info["project_url"] if isinstance(info["project_url"], list) else [info["project_url"]]
+        for u in urls[:3]:
+            links.append(str(u))
+    if info.get("package_url"):
+        links.append(f"PyPI: {info['package_url']}")
+    if links:
+        parts.append("\n".join(f"- {l}" for l in links) + "\n")
+
+    # Dependencies
+    deps = info.get("requires_dist") or []
+    if deps:
+        parts.append(f"**Dependencies ({len(deps)}):**")
+        for d in deps[:20]:
+            parts.append(f"- {d}")
+        if len(deps) > 20:
+            parts.append(f"- ... and {len(deps) - 20} more")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def _format_npm(data: dict, name: str, version: str | None = None) -> str:
+    """Format npm package info."""
+    parts = [f"## package_info: {name} (npm)\n"]
+
+    latest = data.get("dist-tags", {}).get("latest", "")
+    ver_data = data.get("versions", {}).get(latest, {})
+
+    desc = data.get("description") or ver_data.get("description", "")
+    if desc:
+        parts.append(f"**{desc}**\n")
+
+    meta = []
+    if latest:
+        meta.append(f"Latest: {latest}")
+    if data.get("license"):
+        meta.append(f"License: {data['license']}")
+    if meta:
+        parts.append("*" + " | ".join(meta) + "*\n")
+
+    if data.get("homepage"):
+        parts.append(f"- Homepage: {data['homepage']}")
+    if data.get("repository", {}).get("url"):
+        repo_url = data["repository"]["url"]
+        repo_url = repo_url.removeprefix("git+").removesuffix(".git")
+        parts.append(f"- Repository: {repo_url}")
+    if data.get("bugs", {}).get("url"):
+        parts.append(f"- Issues: {data['bugs']['url']}")
+    parts.append("")
+
+    # Dependencies
+    deps = ver_data.get("dependencies", {})
+    if deps:
+        parts.append(f"**Dependencies ({len(deps)}):**")
+        for dep, ver in list(deps.items())[:20]:
+            parts.append(f"- {dep}: {ver}")
+        if len(deps) > 20:
+            parts.append(f"- ... and {len(deps) - 20} more")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def _format_crates(crate: dict, name: str) -> str:
+    """Format crates.io package info."""
+    parts = [f"## package_info: {name} (crates.io)\n"]
+
+    if crate.get("description"):
+        parts.append(f"**{crate['description']}**\n")
+
+    meta = []
+    if crate.get("max_version"):
+        meta.append(f"Latest: {crate['max_version']}")
+    if crate.get("downloads"):
+        meta.append(f"Downloads: {_human_count(crate['downloads'])}")
+    if crate.get("license"):
+        meta.append(f"License: {crate['license']}")
+    if crate.get("updated_at"):
+        meta.append(f"Updated: {crate['updated_at'][:10]}")
+    if meta:
+        parts.append("*" + " | ".join(meta) + "*\n")
+
+    if crate.get("homepage"):
+        parts.append(f"- Homepage: {crate['homepage']}")
+    if crate.get("repository"):
+        parts.append(f"- Repository: {crate['repository']}")
+    if crate.get("documentation"):
+        parts.append(f"- Docs: {crate['documentation']}")
+    parts.append("")
+
+    # Categories / keywords
+    keywords = crate.get("keywords", [])
+    if keywords:
+        parts.append(f"**Keywords:** {', '.join(keywords)}")
+    categories = crate.get("categories", [])
+    if categories:
+        parts.append(f"**Categories:** {', '.join(categories)}")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Content fetcher with fallback chain
 # ---------------------------------------------------------------------------
 
@@ -1328,7 +2016,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="4.2.0")
+server = Server("free-web-search", version="5.0.0")
 
 
 @server.list_tools()
@@ -1605,6 +2293,215 @@ async def list_tools() -> list[Tool]:
             },
             annotations=READ_ONLY_HINT,
         ),
+        Tool(
+            name="github_repo_info",
+            description=(
+                "Get repository info from GitHub: README, stars, language, license, topics. "
+                "Returns structured metadata + README content.\n\n"
+                "Examples:\n"
+                '- github_repo_info(owner="anthropics", repo="claude-code")\n'
+                '- github_repo_info(owner="pallets", repo="flask", include_readme=false)'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "GitHub owner/org (e.g. 'pallets')"},
+                    "repo": {"type": "string", "description": "Repository name (e.g. 'flask')"},
+                    "include_readme": {
+                        "type": "boolean",
+                        "description": "Include README content (default: true)",
+                        "default": True,
+                    },
+                },
+                "required": ["owner", "repo"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="github_file_content",
+            description=(
+                "Fetch a specific file's content from a GitHub repository. Returns raw code/text. "
+                "Supports any text file: source code, config, markdown, etc.\n\n"
+                "Examples:\n"
+                '- github_file_content(owner="python", repo="cpython", path="Lib/os.py")\n'
+                '- github_file_content(owner="pallets", repo="flask", path="pyproject.toml", branch="main")'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "GitHub owner/org"},
+                    "repo": {"type": "string", "description": "Repository name"},
+                    "path": {"type": "string", "description": "File path within repo (e.g. 'src/main.py')"},
+                    "branch": {
+                        "type": "string",
+                        "description": "Git branch/tag (default: repo's default branch)",
+                        "default": None,
+                    },
+                    "max_length": {
+                        "type": "integer",
+                        "description": "Max content length in characters (default 15000, max 50000)",
+                        "default": 15000,
+                    },
+                },
+                "required": ["owner", "repo", "path"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="github_search_repos",
+            description=(
+                "Search GitHub for repositories. Supports GitHub search syntax: language, stars, topics.\n\n"
+                "Examples:\n"
+                '- github_search_repos(query="python web framework")\n'
+                '- github_search_repos(query="mcp server", language="typescript", min_stars=100)\n'
+                '- github_search_repos(query="http client", language="rust", sort="stars")'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query. Supports GitHub syntax."},
+                    "language": {
+                        "type": "string",
+                        "description": "Filter by language (e.g. 'python', 'rust', 'typescript')",
+                        "default": None,
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["stars", "forks", "updated"],
+                        "description": "Sort by (default: stars)",
+                        "default": "stars",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max results (1-30, default 10)",
+                        "default": 10,
+                    },
+                    "min_stars": {
+                        "type": "integer",
+                        "description": "Minimum star count filter",
+                        "default": None,
+                    },
+                },
+                "required": ["query"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="github_issues",
+            description=(
+                "List or fetch GitHub issues and pull requests. Get details, search within issues, filter by state.\n\n"
+                "Examples:\n"
+                '- github_issues(owner="pallets", repo="flask")\n'
+                '- github_issues(owner="pallets", repo="flask", issue_number=5917)\n'
+                '- github_issues(owner="microsoft", repo="vscode", issue_type="pr", state="closed", search="fix terminal")'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "GitHub owner/org"},
+                    "repo": {"type": "string", "description": "Repository name"},
+                    "issue_number": {
+                        "type": "integer",
+                        "description": "Fetch a specific issue/PR by number (omit to list)",
+                        "default": None,
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["open", "closed", "all"],
+                        "description": "Issue state filter (default: open)",
+                        "default": "open",
+                    },
+                    "issue_type": {
+                        "type": "string",
+                        "enum": ["issue", "pr", "all"],
+                        "description": "Filter by type (default: issue)",
+                        "default": "issue",
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Search within issue titles/bodies",
+                        "default": "",
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["updated", "created", "comments"],
+                        "description": "Sort by (default: updated)",
+                        "default": "updated",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max results for listing (1-30, default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["owner", "repo"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="code_search",
+            description=(
+                "Search code across GitHub repositories. Finds usage patterns, examples, and implementations. "
+                "Powered by grep.app (free, no API key).\n\n"
+                "Examples:\n"
+                '- code_search(query="asyncio.run")\n'
+                '- code_search(query="FastAPI decorator", language="python")\n'
+                '- code_search(query="useEffect cleanup", language="typescript")'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Code search query"},
+                    "language": {
+                        "type": "string",
+                        "description": "Filter by language (e.g. 'python', 'rust', 'typescript')",
+                        "default": None,
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Restrict to a specific repo (e.g. 'python/cpython')",
+                        "default": None,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max results (1-20, default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["query"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="package_info",
+            description=(
+                "Look up package metadata from PyPI, npm, or crates.io. "
+                "Returns version, dependencies, license, links.\n\n"
+                "Examples:\n"
+                '- package_info(name="flask", registry="pypi")\n'
+                '- package_info(name="react", registry="npm")\n'
+                '- package_info(name="tokio", registry="crates")'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Package name"},
+                    "registry": {
+                        "type": "string",
+                        "enum": ["pypi", "npm", "crates"],
+                        "description": "Package registry (default: pypi)",
+                        "default": "pypi",
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "Specific version (default: latest)",
+                        "default": None,
+                    },
+                },
+                "required": ["name"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
     ]
 
 
@@ -1838,6 +2735,88 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                 return [TextContent(type="text", text="\n".join(lines))]
             except Exception as e:
                 return error_result(f"Related searches error: {e}")
+
+        elif name == "github_repo_info":
+            owner = arguments.get("owner", "")
+            repo = arguments.get("repo", "")
+            if not owner or not repo:
+                return error_result("Error: 'owner' and 'repo' are required")
+            include_readme = arguments.get("include_readme", True)
+            try:
+                result = await github_repo_info(owner, repo, include_readme)
+                return [TextContent(type="text", text=result)]
+            except Exception as e:
+                return error_result(f"GitHub repo info error: {e}")
+
+        elif name == "github_file_content":
+            owner = arguments.get("owner", "")
+            repo = arguments.get("repo", "")
+            path = arguments.get("path", "")
+            if not owner or not repo or not path:
+                return error_result("Error: 'owner', 'repo', and 'path' are required")
+            branch = arguments.get("branch")
+            max_length = min(arguments.get("max_length", 15000), 50000)
+            try:
+                result = await github_file_content(owner, repo, path, branch, max_length)
+                return [TextContent(type="text", text=result)]
+            except Exception as e:
+                return error_result(f"GitHub file content error: {e}")
+
+        elif name == "github_search_repos":
+            query = arguments.get("query", "")
+            if not query:
+                return error_result("Error: 'query' is required")
+            language = arguments.get("language")
+            sort = arguments.get("sort", "stars")
+            max_results = max(1, min(30, arguments.get("max_results", 10)))
+            min_stars = arguments.get("min_stars")
+            try:
+                result = await github_search_repos(query, language, sort, max_results, min_stars)
+                return [TextContent(type="text", text=result)]
+            except Exception as e:
+                return error_result(f"GitHub search error: {e}")
+
+        elif name == "github_issues":
+            owner = arguments.get("owner", "")
+            repo = arguments.get("repo", "")
+            if not owner or not repo:
+                return error_result("Error: 'owner' and 'repo' are required")
+            issue_number = arguments.get("issue_number")
+            state = arguments.get("state", "open")
+            issue_type = arguments.get("issue_type", "issue")
+            search = arguments.get("search", "")
+            sort = arguments.get("sort", "updated")
+            max_results = max(1, min(30, arguments.get("max_results", 10)))
+            try:
+                result = await github_issues(owner, repo, issue_number, state, issue_type, search, sort, max_results)
+                return [TextContent(type="text", text=result)]
+            except Exception as e:
+                return error_result(f"GitHub issues error: {e}")
+
+        elif name == "code_search":
+            query = arguments.get("query", "")
+            if not query:
+                return error_result("Error: 'query' is required")
+            language = arguments.get("language")
+            repo = arguments.get("repo")
+            max_results = max(1, min(20, arguments.get("max_results", 10)))
+            try:
+                result = await code_search(query, language, repo, max_results)
+                return [TextContent(type="text", text=result)]
+            except Exception as e:
+                return error_result(f"Code search error: {e}")
+
+        elif name == "package_info":
+            pkg_name = arguments.get("name", "")
+            if not pkg_name:
+                return error_result("Error: 'name' is required")
+            registry = arguments.get("registry", "pypi")
+            version = arguments.get("version")
+            try:
+                result = await package_info(pkg_name, registry, version)
+                return [TextContent(type="text", text=result)]
+            except Exception as e:
+                return error_result(f"Package info error: {e}")
 
         else:
             return error_result(f"Unknown tool: {name}")
