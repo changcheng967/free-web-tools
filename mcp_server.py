@@ -157,7 +157,7 @@ async def close_shared_client():
 
 
 # ---------------------------------------------------------------------------
-# Retry helper (BUG FIX v4: uses callable factory, not a coroutine object)
+# Retry helper
 # ---------------------------------------------------------------------------
 
 async def _retry_async(
@@ -1066,7 +1066,6 @@ async def fetch_with_jina(
 
 # ---------------------------------------------------------------------------
 # Trafilatura — content extraction (local fallback, rich metadata)
-# BUG FIX v4: no double-fetch, uses already-fetched HTML
 # ---------------------------------------------------------------------------
 
 async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> ExtractedContent:
@@ -1121,21 +1120,44 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
 
 
 # ---------------------------------------------------------------------------
-# StackOverflow — API fallback (direct fetch is 403'd)
+# StackExchange — API fallback for StackOverflow, AskUbuntu, ServerFault, etc.
 # ---------------------------------------------------------------------------
 
-async def _fetch_stackoverflow(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
-    """Fetch StackOverflow Q&A via StackExchange API (free, no key needed)."""
-    match = re.search(r'stackoverflow\.com/questions/(\d+)', url)
+_SE_SITE_MAP = {
+    "stackoverflow.com": "stackoverflow",
+    "serverfault.com": "serverfault",
+    "superuser.com": "superuser",
+    "askubuntu.com": "askubuntu",
+    "math.stackexchange.com": "math",
+    "stats.stackexchange.com": "stats",
+    "physics.stackexchange.com": "physics",
+    "dba.stackexchange.com": "dba",
+    "unix.stackexchange.com": "unix",
+    "security.stackexchange.com": "security",
+}
+
+async def _fetch_stackexchange(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
+    """Fetch StackExchange Q&A via API (free, no key needed). Supports all SE sites."""
+    # Match any StackExchange site URL with a question ID
+    match = re.search(r'(?:stackoverflow|serverfault|superuser|askubuntu|[a-z]+\.stackexchange)\.com/questions/(\d+)', url)
     if not match:
         return None
     qid = match.group(1)
+
+    # Determine the API site parameter
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    site = _SE_SITE_MAP.get(host, "stackoverflow")
+    # For *.stackexchange.com, extract subdomain as site
+    if host.endswith(".stackexchange.com") and host not in _SE_SITE_MAP:
+        subdomain = host.replace(".stackexchange.com", "")
+        site = subdomain
 
     try:
         # Fetch question
         resp = await client.get(
             f"https://api.stackexchange.com/2.3/questions/{qid}",
-            params={"order": "desc", "sort": "activity", "site": "stackoverflow", "filter": "withbody"},
+            params={"order": "desc", "sort": "activity", "site": site, "filter": "withbody"},
             timeout=10.0,
         )
         resp.raise_for_status()
@@ -1151,7 +1173,7 @@ async def _fetch_stackoverflow(client: httpx.AsyncClient, url: str) -> Extracted
         # Fetch top answer
         ans_resp = await client.get(
             f"https://api.stackexchange.com/2.3/questions/{qid}/answers",
-            params={"order": "desc", "sort": "votes", "site": "stackoverflow", "filter": "withbody", "pagesize": "3"},
+            params={"order": "desc", "sort": "votes", "site": site, "filter": "withbody", "pagesize": "3"},
             timeout=10.0,
         )
         ans_data = ans_resp.json()
@@ -1175,7 +1197,7 @@ async def _fetch_stackoverflow(client: httpx.AsyncClient, url: str) -> Extracted
             content=content,
             title=title,
             url=url,
-            extraction_method="stackoverflow_api",
+            extraction_method="stackexchange_api",
         )
     except Exception as e:
         logger.warning("StackOverflow API fetch failed: %s", e)
@@ -1990,8 +2012,8 @@ async def fetch_content(
             ec.content = _smart_truncate(ec.content, max_length)
             return ec
 
-    if "stackoverflow.com/questions/" in url:
-        ec = await _fetch_stackoverflow(client, url)
+    if re.search(r'(?:stackoverflow|serverfault|superuser|askubuntu|[a-z]+\.stackexchange)\.com/questions/\d+', url):
+        ec = await _fetch_stackexchange(client, url)
         if ec and ec.content and len(ec.content.strip()) > 50:
             ec.content = _smart_truncate(ec.content, max_length)
             return ec
@@ -2087,10 +2109,7 @@ def _apply_domain_filter(
     include_domains: list[str] | None,
     exclude_domains: list[str] | None,
 ) -> list[SearchResult]:
-    """Filter results by domain allowlist/blocklist.
-
-    BUG FIX v4: uses proper subdomain matching via _domain_matches().
-    """
+    """Filter results by domain allowlist/blocklist."""
     if include_domains:
         results = [r for r in results
                    if any(_domain_matches(r.url, d) for d in include_domains)]
@@ -2102,7 +2121,6 @@ def _apply_domain_filter(
 
 # ---------------------------------------------------------------------------
 # Format helpers (Markdown, LLM-optimized)
-# BUG FIX v4: format_fetch_content metadata uses proper separator
 # ---------------------------------------------------------------------------
 
 def format_search_results(results: list[SearchResult], query: str, tool_name: str = "web_search") -> str:
