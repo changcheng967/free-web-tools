@@ -2235,8 +2235,10 @@ def format_instant_answer(data: dict[str, Any], query: str) -> str:
             "No structured answer found for this query. "
             "Try:\n"
             "- Rephrasing as a factual question (e.g. \"What is X?\", \"Who invented Y?\")\n"
+            "- Using `auto_answer` for comprehensive multi-source answers\n"
             "- Using `web_search` or `deep_search` for broader topics\n"
-            "- Using `wiki_summary` for encyclopedic topics"
+            "- Using `wiki_summary` for encyclopedic topics\n"
+            "- Using `wiki_search` to find Wikipedia articles by keyword"
         )
 
     return "\n".join(parts)
