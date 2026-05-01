@@ -344,17 +344,20 @@ def _extract_wiki_query(query: str) -> str:
 
     "What is quantum entanglement?" -> "quantum entanglement"
     "Who invented the telephone?" -> "telephone"
+    "How does CRISPR work?" -> "CRISPR"
     """
     q = query.strip().rstrip("?!.!")
     # Remove common question prefixes (case-insensitive)
     q = re.sub(
         r'^(what\s+(?:is|are|was|were)\s+|who\s+(?:is|are|was|were|invented|discovered|created)\s+|'
         r'when\s+(?:was|were|is|did)\s+|where\s+(?:is|are|was|were)\s+|'
-        r'how\s+(?:does|do|did|is|are|was|were)\s+|why\s+(?:do|does|did|is|are|was|were)\s+)',
+        r'how\s+(?:does|do|did|is|are|was|were|to)\s+|why\s+(?:do|does|did|is|are|was|were)\s+)',
         '', q, flags=re.IGNORECASE,
     )
-    # Remove common filler words
-    q = re.sub(r'\b(?:the|a|an|of|in|for|to|about)\b', '', q, flags=re.IGNORECASE)
+    # Strip trailing filler like "in Python", "work?", etc.
+    q = re.sub(r'\s+(?:work|mean|used for|work|function)$', '', q, flags=re.IGNORECASE)
+    # Remove leading articles only
+    q = re.sub(r'^(?:the|a|an)\s+', '', q, flags=re.IGNORECASE)
     # Collapse whitespace and strip
     q = re.sub(r'\s+', ' ', q).strip()
     return q
@@ -1993,6 +1996,51 @@ async def fetch_content(
             ec.content = _smart_truncate(ec.content, max_length)
             return ec
 
+    # PyPI package pages -> structured API data
+    pypi_match = re.match(r'https?://pypi\.org/project/([^/]+)', url)
+    if pypi_match:
+        try:
+            result_text = await _fetch_pypi(client, pypi_match.group(1))
+            return ExtractedContent(
+                content=_smart_truncate(result_text, max_length),
+                title=pypi_match.group(1),
+                url=url,
+                site_name="PyPI",
+                extraction_method="pypi_api",
+            )
+        except Exception as e:
+            logger.warning("PyPI API fetch failed for %s: %s", url, e)
+
+    # npm package pages -> structured API data
+    npm_match = re.match(r'https?://(?:www\.)?npmjs\.com/package/([^/?#]+)', url)
+    if npm_match:
+        try:
+            result_text = await _fetch_npm(client, npm_match.group(1))
+            return ExtractedContent(
+                content=_smart_truncate(result_text, max_length),
+                title=npm_match.group(1),
+                url=url,
+                site_name="npm",
+                extraction_method="npm_api",
+            )
+        except Exception as e:
+            logger.warning("npm API fetch failed for %s: %s", url, e)
+
+    # crates.io package pages -> structured API data
+    crates_match = re.match(r'https?://crates\.io/crates/([^/?#]+)', url)
+    if crates_match:
+        try:
+            result_text = await _fetch_crates(client, crates_match.group(1))
+            return ExtractedContent(
+                content=_smart_truncate(result_text, max_length),
+                title=crates_match.group(1),
+                url=url,
+                site_name="crates.io",
+                extraction_method="crates_api",
+            )
+        except Exception as e:
+            logger.warning("crates.io API fetch failed for %s: %s", url, e)
+
     try:
         ec = await fetch_with_jina(client, url, return_format, with_links)
         if ec.content and len(ec.content.strip()) > 100:
@@ -3102,6 +3150,15 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                     wiki_data = gathered[1]
                 elif isinstance(gathered[1], Exception):
                     logger.warning("auto_answer: wiki_summary failed: %s", gathered[1])
+
+                # If wiki_summary returned empty, try wiki_search as fallback
+                if not wiki_data.get("extract"):
+                    try:
+                        wiki_results = await wiki_search(query, max_results=1)
+                        if wiki_results:
+                            wiki_data = await get_wiki_summary(wiki_results[0]["title"])
+                    except Exception as e:
+                        logger.warning("auto_answer: wiki_search fallback failed: %s", e)
 
                 search_results = []
                 if isinstance(gathered[2], list):
