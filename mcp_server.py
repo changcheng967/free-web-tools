@@ -2005,9 +2005,11 @@ async def fetch_content(
             # Strip anchor fragments
             title = title.split("#")[0].strip()
             data = await get_wiki_summary(title, lang)
-            if data.get("extract"):
+            extract = data.get("extract", "")
+            # Only use API result if it has substantial content (skip disambiguation pages)
+            if extract and len(extract) > 100:
                 return ExtractedContent(
-                    content=data["extract"],
+                    content=extract,
                     title=data.get("title", title),
                     url=url,
                     date=data.get("timestamp", ""),
@@ -2016,6 +2018,9 @@ async def fetch_content(
                     site_name="Wikipedia",
                     extraction_method="wikipedia_api",
                 )
+        except Exception as e:
+            logger.warning("Wikipedia API fetch failed for %s: %s", url, e)
+        # Fall through to Jina/trafilatura for disambiguation or failed API
         except Exception as e:
             logger.warning("Wikipedia API fetch failed for %s: %s", url, e)
 
