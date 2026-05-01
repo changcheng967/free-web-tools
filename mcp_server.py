@@ -2525,9 +2525,13 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Fetch and extract readable content from a URL. Returns Markdown with metadata header "
                 "(Title | Author | Site | Date | Language | Method). Handles JavaScript-rendered pages.\n\n"
+                "Smart routing: GitHub repos -> GitHub API, PyPI/npm/crates.io -> registry API, "
+                "StackExchange -> SE API, arXiv -> metadata extraction.\n\n"
                 "Examples:\n"
                 '- fetch_url(url="https://docs.python.org/3/library/asyncio.html")\n'
                 '- fetch_url(url="https://en.wikipedia.org/wiki/Quantum_computing")\n'
+                '- fetch_url(url="https://github.com/pallets/flask")\n'
+                '- fetch_url(url="https://pypi.org/project/requests/")\n'
                 '- fetch_url(url="https://example.com/article", max_length=8000)\n'
                 '- fetch_url(url="https://example.com", return_format="text")\n'
                 '- fetch_url(url="https://example.com/blog", with_links=true)'
