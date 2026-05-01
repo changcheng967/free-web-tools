@@ -23,7 +23,7 @@ claude mcp add free-web-search -- python -m mcp_server
 # }
 ```
 
-## Tools (14)
+## Tools (16)
 
 | Tool | Purpose | Backend |
 |------|---------|---------|
@@ -33,6 +33,8 @@ claude mcp add free-web-search -- python -m mcp_server
 | `deep_search` | Search + full content from top results (research tool) | Parallel search + parallel fetch |
 | `instant_answer` | Factual/definitional answers (infobox, key facts) | DDG Instant Answer API + Wikipedia fallback |
 | `wiki_summary` | Wikipedia article summary (all languages) | Wikipedia REST API |
+| `wiki_search` | Search Wikipedia articles by keyword (full-text) | MediaWiki Search API |
+| `book_search` | Search books by title, author, topic (covers, ISBN) | Open Library Search API |
 | `auto_answer` | Comprehensive answer from multiple sources at once | DDG + Wikipedia + web search (parallel, fault-tolerant) |
 | `related_searches` | Related/expanded query suggestions | DDG autocomplete + Bing Suggest fallback |
 | `github_repo_info` | GitHub repo README + metadata (stars, language, license) | GitHub REST API + raw.githubusercontent.com |
@@ -56,6 +58,10 @@ claude mcp add free-web-search -- python -m mcp_server
 
 **`wiki_summary`** — Best for encyclopedic topics. Supports all Wikipedia languages via `lang` param.
 
+**`wiki_search`** — Full-text search across Wikipedia articles. Returns matching articles with titles, snippets, and links. Unlike `wiki_summary` which needs exact title, this finds articles by keyword. Supports all languages.
+
+**`book_search`** — Search for books via Open Library. Returns title, author, year, publisher, subjects, ISBN, and cover image URL. Free, no API key.
+
 **`auto_answer`** — Comprehensive answer engine: fires DDG Instant Answer, Wikipedia, and web search in parallel.
 
 **`related_searches`** — Get related/expanded query suggestions.
@@ -76,7 +82,8 @@ claude mcp add free-web-search -- python -m mcp_server
 
 - **Search**: DuckDuckGo Lite + Mojeek + Bing + Startpage (4-way parallel, merge results — better coverage)
 - **Answer engine**: DuckDuckGo Instant Answer API + Wikipedia fallback (structured factual data)
-- **Encyclopedia**: Wikipedia REST Summary API (all languages)
+- **Encyclopedia**: Wikipedia REST Summary API (all languages) + MediaWiki Search API (full-text article search)
+- **Books**: Open Library Search API (free book search with covers, ISBN, metadata)
 - **Comprehensive**: `auto_answer` combines instant answer + Wikipedia + web search (fault-tolerant)
 - **GitHub**: REST API (60 req/hr) + raw.githubusercontent.com (unlimited) for repo info, file content, issues/PRs, repo search
 - **Code search**: grep.app API (free, unlimited) for cross-repo code search

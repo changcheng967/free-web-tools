@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.2.0.
+"""Free Web Search MCP Server v5.3.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -862,6 +862,130 @@ async def get_wiki_summary(title: str, lang: str = "en") -> dict[str, Any]:
         return {}
     resp.raise_for_status()
     return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Wikipedia Search (MediaWiki API — full-text search across articles)
+# ---------------------------------------------------------------------------
+
+async def wiki_search(query: str, lang: str = "en", max_results: int = 10) -> list[dict[str, str]]:
+    """Search Wikipedia articles using MediaWiki full-text search API.
+
+    Returns list of dicts with keys: title, snippet, url.
+    Unlike wiki_summary which requires exact title, this does fuzzy matching.
+    """
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": min(max_results, 20),
+        "format": "json",
+        "utf8": 1,
+    }
+    url = f"https://{lang}.wikipedia.org/w/api.php?{urllib.parse.urlencode(params)}"
+
+    client = _get_shared_client()
+    resp = await _retry_async(client.get, retries=1, url=url, headers=_search_headers())
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for item in data.get("query", {}).get("search", []):
+        title = item.get("title", "")
+        # Strip HTML tags and decode HTML entities from snippet
+        snippet = re.sub(r"<[^>]+>", "", item.get("snippet", ""))
+        snippet = snippet.replace("&#039;", "'").replace("&amp;", "&").replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
+        # Strip HTML tags from snippet
+        snippet = re.sub(r"<[^>]+>", "", item.get("snippet", ""))
+        encoded_title = urllib.parse.quote(title.replace(" ", "_"))
+        page_url = f"https://{lang}.wikipedia.org/wiki/{encoded_title}"
+        results.append({"title": title, "snippet": snippet, "url": page_url})
+
+    return results
+
+
+def _format_wiki_search(results: list[dict[str, str]], query: str, lang: str) -> str:
+    """Format Wikipedia search results into Markdown."""
+    parts = [f"## wiki_search: {query} ({len(results)} results)\n"]
+    if lang != "en":
+        parts.insert(1, f"*Language: {lang}*\n")
+    for i, r in enumerate(results, 1):
+        parts.append(f"### [{r['title']}]({r['url']})")
+        if r["snippet"]:
+            parts.append(f"> {r['snippet']}\n")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Open Library Search API (free book search, no API key)
+# ---------------------------------------------------------------------------
+
+async def book_search(query: str, max_results: int = 10) -> list[dict[str, Any]]:
+    """Search books via Open Library Search API. Returns title, author, year, cover."""
+    params = {
+        "q": query,
+        "limit": min(max_results, 20),
+        "fields": "title,author_name,first_publish_year,publisher,subject,isbn,cover_i,key",
+    }
+    url = f"https://openlibrary.org/search.json?{urllib.parse.urlencode(params)}"
+
+    client = _get_shared_client()
+    resp = await _retry_async(client.get, retries=1, url=url)
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for doc in data.get("docs", []):
+        cover_id = doc.get("cover_i")
+        cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
+        work_key = doc.get("key", "")
+        ol_url = f"https://openlibrary.org{work_key}" if work_key else ""
+        results.append({
+            "title": doc.get("title", ""),
+            "authors": doc.get("author_name", []),
+            "year": doc.get("first_publish_year"),
+            "publishers": doc.get("publisher", [])[:3],
+            "subjects": doc.get("subject", [])[:5],
+            "isbn": doc.get("isbn", [""])[:3],
+            "cover_url": cover_url,
+            "url": ol_url,
+        })
+    return results
+
+
+def _format_book_search(results: list[dict[str, Any]], query: str) -> str:
+    """Format Open Library search results into Markdown."""
+    parts = [f"## book_search: {query} ({len(results)} results)\n"]
+
+    for i, r in enumerate(results, 1):
+        title_line = f"### [{r['title']}]({r['url']})" if r["url"] else f"### {r['title']}"
+        parts.append(title_line)
+
+        meta = []
+        if r["authors"]:
+            authors_str = ", ".join(r["authors"][:3])
+            meta.append(f"by {authors_str}")
+        if r["year"]:
+            meta.append(str(r["year"]))
+        if meta:
+            parts.append(f"*{' | '.join(meta)}*")
+
+        if r["publishers"]:
+            parts.append(f"Publisher: {', '.join(r['publishers'])}")
+
+        if r["subjects"]:
+            subjects = ", ".join(r["subjects"][:5])
+            parts.append(f"Subjects: {subjects}")
+
+        if r["isbn"]:
+            parts.append(f"ISBN: {', '.join(r['isbn'])}")
+
+        if r["cover_url"]:
+            parts.append(f"[Cover]({r['cover_url']})")
+
+        parts.append("")
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -2142,7 +2266,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.2.0")
+server = Server("free-web-search", version="5.3.0")
 
 
 @server.list_tools()
@@ -2370,6 +2494,66 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["title"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="wiki_search",
+            description=(
+                "Search Wikipedia articles by keyword. Returns matching articles with titles, snippets, and links. "
+                "Unlike wiki_summary which requires exact title, this does full-text search. "
+                "Supports all Wikipedia languages.\n\n"
+                "Examples:\n"
+                '- wiki_search(query="quantum computing")\n'
+                '- wiki_search(query="French Revolution", lang="fr")\n'
+                '- wiki_search(query="machine learning", max_results=5)'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for Wikipedia articles",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "Wikipedia language code (default 'en'). Examples: 'de', 'fr', 'es', 'zh', 'ja'",
+                        "default": "en",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results (1-20, default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["query"],
+            },
+            annotations=READ_ONLY_HINT,
+        ),
+        Tool(
+            name="book_search",
+            description=(
+                "Search for books using Open Library. Returns title, author, year, publisher, subjects, ISBN, and cover. "
+                "Free, no API key. Great for finding books on a topic, by an author, or by title.\n\n"
+                "Examples:\n"
+                '- book_search(query="The Great Gatsby")\n'
+                '- book_search(query="machine learning textbook")\n'
+                '- book_search(query="Tolkien", max_results=5)'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Book search query (title, author, topic, ISBN)",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results (1-20, default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["query"],
             },
             annotations=READ_ONLY_HINT,
         ),
@@ -2797,6 +2981,37 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                 return [TextContent(type="text", text=format_wiki_summary(data, title, lang))]
             except Exception as e:
                 return error_result(f"Wikipedia summary error: {e}")
+
+        elif name == "wiki_search":
+            query = arguments.get("query", "")
+            if not query:
+                return error_result("Error: 'query' is required")
+
+            lang = arguments.get("lang", "en") or "en"
+            max_results = max(1, min(20, arguments.get("max_results", 10)))
+
+            try:
+                results = await wiki_search(query, lang, max_results)
+                if not results:
+                    return [TextContent(type="text", text=f"## wiki_search: {query}\n\nNo Wikipedia articles found.")]
+                return [TextContent(type="text", text=_format_wiki_search(results, query, lang))]
+            except Exception as e:
+                return error_result(f"Wikipedia search error: {e}")
+
+        elif name == "book_search":
+            query = arguments.get("query", "")
+            if not query:
+                return error_result("Error: 'query' is required")
+
+            max_results = max(1, min(20, arguments.get("max_results", 10)))
+
+            try:
+                results = await book_search(query, max_results)
+                if not results:
+                    return [TextContent(type="text", text=f"## book_search: {query}\n\nNo books found.")]
+                return [TextContent(type="text", text=_format_book_search(results, query))]
+            except Exception as e:
+                return error_result(f"Book search error: {e}")
 
         elif name == "auto_answer":
             query = arguments.get("query", "")
