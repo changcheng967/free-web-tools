@@ -2357,14 +2357,19 @@ def format_auto_answer(
 
     # Wikipedia extract (usually high quality for factual queries)
     wiki_extract = wiki_data.get("extract", "")
+    # Skip if DDG abstract and wiki extract are nearly identical
+    abstract = instant_data.get("Abstract", "")
+    is_duplicate = abstract and wiki_extract and (
+        wiki_extract[:100].lower() == abstract[:100].lower()
+        or abstract[:200] in wiki_extract[:300]
+    )
     if wiki_extract and not has_content:
         parts.append(f"**From Wikipedia — {wiki_data.get('title', query)}:**\n")
         parts.append(wiki_extract)
         has_content = True
-    elif wiki_extract and has_content:
-        # Add Wikipedia as supplementary
+    elif wiki_extract and has_content and not is_duplicate:
+        # Add Wikipedia as supplementary (only if not duplicate of DDG abstract)
         parts.append(f"**Additional context (Wikipedia):**\n")
-        # Use a shorter version
         truncated = _smart_truncate(wiki_extract, 2000)
         parts.append(truncated)
 
