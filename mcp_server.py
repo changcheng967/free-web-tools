@@ -1076,15 +1076,15 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
     doc = trafilatura.bare_extraction(resp.text)
 
     if doc and doc.text:
-        title = doc.title or ""
+        title = clean_title(doc.title or "")
         # Fallback: extract title from HTML if trafilatura missed it
         if not title:
             soup = BeautifulSoup(resp.text, "lxml")
             h1 = soup.find("h1")
             if h1:
-                title = h1.get_text(strip=True)
+                title = clean_title(h1.get_text(strip=True))
             elif soup.title and soup.title.string:
-                title = soup.title.string.strip()
+                title = clean_title(soup.title.string.strip())
         return ExtractedContent(
             content=doc.text,
             title=title,
@@ -1106,9 +1106,9 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
     title = ""
     h1 = soup.find("h1")
     if h1:
-        title = h1.get_text(strip=True)
+        title = clean_title(h1.get_text(strip=True))
     elif soup.title and soup.title.string:
-        title = soup.title.string.strip()
+        title = clean_title(soup.title.string.strip())
     return ExtractedContent(
         content=text,
         title=title,
@@ -1947,6 +1947,38 @@ async def fetch_content(
         raise ValueError(f"Invalid URL scheme: {url}. Must start with http:// or https://")
 
     client = _get_shared_client()
+
+    # GitHub repo URLs — use API for better structured content
+    gh_match = re.match(r'https?://github\.com/([^/]+)/([^/]+)/?$', url)
+    if gh_match:
+        try:
+            owner, repo = gh_match.group(1), gh_match.group(2)
+            result_text = await github_repo_info(owner, repo, include_readme=True)
+            return ExtractedContent(
+                content=_smart_truncate(result_text, max_length),
+                title=f"{owner}/{repo}",
+                url=url,
+                site_name="GitHub",
+                extraction_method="github_api",
+            )
+        except Exception as e:
+            logger.warning("GitHub API fetch failed for %s: %s", url, e)
+
+    # GitHub raw file URLs — plain text, fetch directly
+    raw_match = re.match(r'https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)', url)
+    if raw_match:
+        try:
+            resp = await client.get(url, headers=_search_headers(), timeout=10.0)
+            resp.raise_for_status()
+            return ExtractedContent(
+                content=_smart_truncate(resp.text, max_length),
+                title=raw_match.group(4).split("/")[-1],
+                url=url,
+                site_name="GitHub",
+                extraction_method="github_raw",
+            )
+        except Exception as e:
+            logger.warning("GitHub raw fetch failed for %s: %s", url, e)
 
     # Site-specific handling
     if "arxiv.org" in url:
