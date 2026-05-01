@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.3.0.
+"""Free Web Search MCP Server v5.4.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -1242,7 +1242,7 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.3.0",
+    "User-Agent": "free-web-tools-mcp/5.4.0",
 }
 
 
@@ -2375,7 +2375,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.3.0")
+server = Server("free-web-search", version="5.4.0")
 
 
 @server.list_tools()
