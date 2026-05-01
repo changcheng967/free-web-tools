@@ -263,9 +263,11 @@ def _domain_matches(url: str, domain: str) -> bool:
 
 
 def clean_title(title: str) -> str:
-    """Collapse whitespace, remove breadcrumb patterns."""
+    """Collapse whitespace, remove breadcrumb patterns and stray symbols."""
     # Remove breadcrumb: "Home > Category > Title" -> "Title"
     title = re.sub(r'^[\w\s.&-]+(?:\s*>\s*[\w\s.&-]+)+\s*>\s*', '', title)
+    # Remove trailing paragraph markers from docs pages
+    title = title.replace("¶", "").strip()
     # Collapse whitespace
     title = re.sub(r'\s+', ' ', title).strip()
     return title
@@ -1074,9 +1076,18 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
     doc = trafilatura.bare_extraction(resp.text)
 
     if doc and doc.text:
+        title = doc.title or ""
+        # Fallback: extract title from HTML if trafilatura missed it
+        if not title:
+            soup = BeautifulSoup(resp.text, "lxml")
+            h1 = soup.find("h1")
+            if h1:
+                title = h1.get_text(strip=True)
+            elif soup.title and soup.title.string:
+                title = soup.title.string.strip()
         return ExtractedContent(
             content=doc.text,
-            title=doc.title or "",
+            title=title,
             url=url,
             date=doc.date or "",
             language=doc.language or "",
@@ -1092,9 +1103,15 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
                      "form", "iframe", "noscript", "svg", "table", "button"]):
         tag.decompose()
     text = soup.get_text(separator="\n", strip=True)
+    title = ""
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(strip=True)
+    elif soup.title and soup.title.string:
+        title = soup.title.string.strip()
     return ExtractedContent(
         content=text,
-        title=soup.title.string if soup.title and soup.title.string else "",
+        title=title,
         url=url,
         extraction_method="beautifulsoup",
     )
@@ -1222,7 +1239,7 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.2.0",
+    "User-Agent": "free-web-tools-mcp/5.3.0",
 }
 
 
@@ -1456,17 +1473,25 @@ async def code_search(
         params["filter[repo][0]"] = repo
 
     try:
-        data = await _retry_async(
-            lambda: client.get(
-                "https://grep.app/api/search",
-                params=params,
-                timeout=12.0,
-                headers={"User-Agent": "free-web-tools-mcp/5.1.0"},
-            ),
+        resp = await _retry_async(
+            client.get,
             retries=2,
             base_delay=2.0,
+            url="https://grep.app/api/search",
+            params=params,
+            timeout=12.0,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            },
         )
-        data = data.json()
+        if resp.status_code == 429:
+            return f"## code_search: {query}\n\nCode search is temporarily rate-limited. Try again in a few minutes."
+        if resp.status_code != 200:
+            raise RuntimeError(f"grep.app returned HTTP {resp.status_code}")
+        data = resp.json()
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Code search failed: {exc}")
 
@@ -1968,8 +1993,10 @@ def post_process_results(results: list[SearchResult]) -> list[SearchResult]:
         r.url = normalize_url(r.url)
         r.title = clean_title(r.title)
         r.snippet = cap_snippet(r.snippet)
-        # Filter empty snippets
-        if not r.snippet.strip():
+        # Use title as fallback snippet when empty
+        if not r.snippet.strip() and r.title:
+            r.snippet = r.title
+        elif not r.snippet.strip():
             continue
         processed.append(r)
     return _dedup_domain(processed)
