@@ -100,7 +100,7 @@ _TRACKING_PARAMS = frozenset([
 _SKIP_DOMAINS = frozenset([
     "mojeek.com", "blocksurvey.io", "facebook.com", "twitter.com",
     "linkedin.com", "instagram.com", "youtube.com/results",
-    "duckduckgo.com",
+    "duckduckgo.com", "buttondown.email",
 ])
 
 # ---------------------------------------------------------------------------
@@ -721,19 +721,28 @@ async def _parallel_search(
         except Exception as exc:
             logger.warning("Search backend failed: %s", exc)
 
-    # Dedup by normalized URL, keeping the result with the longest snippet
+    # Dedup by normalized URL, keeping the result with the longest snippet.
+    # Track which sources saw each URL for cross-validation scoring.
+    url_sources: dict[str, set[str]] = {}
     seen: dict[str, SearchResult] = {}
     for r in all_results:
         key = normalize_url(r.url).lower()
+        url_sources.setdefault(key, set()).add(r.source)
         if key in seen:
             if len(r.snippet) > len(seen[key].snippet):
                 seen[key] = r
         else:
             seen[key] = r
 
+    # Sort: URLs found by more backends rank higher, then interleave by source
+    scored = sorted(
+        seen.values(),
+        key=lambda r: (-len(url_sources.get(normalize_url(r.url).lower(), set())), r.source),
+    )
+
     # Interleave results from different sources for diversity
     by_source: dict[str, list[SearchResult]] = {}
-    for r in seen.values():
+    for r in scored:
         by_source.setdefault(r.source, []).append(r)
 
     merged: list[SearchResult] = []
