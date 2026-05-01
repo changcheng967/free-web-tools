@@ -1996,6 +1996,29 @@ async def fetch_content(
 
     client = _get_shared_client()
 
+    # Wikipedia article URLs -> REST API for cleaner structured content
+    wiki_match = re.match(r'https?://(\w+)\.wikipedia\.org/wiki/(.+)', url)
+    if wiki_match:
+        try:
+            lang = wiki_match.group(1)
+            title = urllib.parse.unquote(wiki_match.group(2)).replace("_", " ")
+            # Strip anchor fragments
+            title = title.split("#")[0].strip()
+            data = await get_wiki_summary(title, lang)
+            if data.get("extract"):
+                return ExtractedContent(
+                    content=data["extract"],
+                    title=data.get("title", title),
+                    url=url,
+                    date=data.get("timestamp", ""),
+                    language=lang,
+                    description=data.get("description", ""),
+                    site_name="Wikipedia",
+                    extraction_method="wikipedia_api",
+                )
+        except Exception as e:
+            logger.warning("Wikipedia API fetch failed for %s: %s", url, e)
+
     # GitHub repo URLs — use API for better structured content
     gh_match = re.match(r'https?://github\.com/([^/]+)/([^/]+)/?$', url)
     if gh_match:
