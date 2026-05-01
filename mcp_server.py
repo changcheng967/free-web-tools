@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.0.0.
+"""Free Web Search MCP Server v5.1.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -675,31 +675,67 @@ async def _parallel_search(
     time_range: str | None = None,
     language: str | None = None,
 ) -> list[SearchResult]:
-    """Race DDG Lite, Mojeek, Bing, and Startpage in parallel; return first that produces results."""
+    """Race all 4 search backends in parallel; merge and dedup results.
+
+    Waits up to 8 seconds for backends to respond. Merges results from all
+    backends that responded, deduplicates by URL, and returns the best results.
+    """
     ddg_task = asyncio.create_task(search_ddg_lite(query, max_results, time_range, language))
     mojeek_task = asyncio.create_task(search_mojeek(query, max_results, language))
     bing_task = asyncio.create_task(search_bing(query, max_results, language, time_range))
     startpage_task = asyncio.create_task(search_startpage(query, max_results, time_range))
 
-    pending = {ddg_task, mojeek_task, bing_task, startpage_task}
+    all_tasks = {ddg_task, mojeek_task, bing_task, startpage_task}
 
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+    # Wait for all backends with 8-second timeout
+    done, pending = await asyncio.wait(all_tasks, timeout=8.0)
 
-        for task in done:
-            try:
-                results = task.result()
-                if results:
-                    # Cancel remaining tasks
-                    for p in pending:
-                        p.cancel()
-                    return results
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Search backend failed: %s", exc)
+    # Cancel any stragglers
+    for t in pending:
+        t.cancel()
+    # Suppress CancelledError from cancelled tasks
+    for t in pending:
+        try:
+            t.result()
+        except (asyncio.CancelledError, Exception):
+            pass
 
-    return []
+    # Collect results from all completed backends
+    all_results: list[SearchResult] = []
+    for t in done:
+        try:
+            results = t.result()
+            if results:
+                all_results.extend(results)
+        except Exception as exc:
+            logger.warning("Search backend failed: %s", exc)
+
+    # Dedup by normalized URL, keeping the result with the longest snippet
+    seen: dict[str, SearchResult] = {}
+    for r in all_results:
+        key = normalize_url(r.url).lower()
+        if key in seen:
+            if len(r.snippet) > len(seen[key].snippet):
+                seen[key] = r
+        else:
+            seen[key] = r
+
+    # Interleave results from different sources for diversity
+    by_source: dict[str, list[SearchResult]] = {}
+    for r in seen.values():
+        by_source.setdefault(r.source, []).append(r)
+
+    merged: list[SearchResult] = []
+    while by_source and len(merged) < max_results:
+        for source in list(by_source):
+            if len(merged) >= max_results:
+                break
+            group = by_source[source]
+            merged.append(group.pop(0))
+            if not group:
+                del by_source[source]
+
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +875,10 @@ async def fetch_with_jina(
     return_format: str = "markdown",
     with_links: bool = False,
 ) -> ExtractedContent:
-    """Fetch content via Jina AI Reader JSON mode for rich metadata.
+    """Fetch content via Jina AI Reader JSON mode (handles JS-rendered pages).
+
+    Jina Reader renders JavaScript server-side, making it the primary method
+    for pages that require JS. Retries once with cache-bypass on empty content.
 
     Args:
         return_format: 'markdown', 'text', or 'html'
@@ -853,13 +892,23 @@ async def fetch_with_jina(
     if with_links:
         headers["X-With-Links-Summary"] = "true"
 
-    resp = await client.get(
-        f"{JINA_READER_URL}/{url}",
-        headers=headers,
-        timeout=25.0,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    for attempt in range(2):
+        resp = await client.get(
+            f"{JINA_READER_URL}/{url}",
+            headers=headers,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("content", "")
+
+        # If first attempt returns empty, retry with forced refresh
+        if not content.strip() and attempt == 0:
+            headers["X-No-Cache"] = "true"
+            headers["X-With-Generated-Alt"] = "true"
+            continue
+
+        break
 
     # Extract links if present
     links = None
@@ -868,7 +917,7 @@ async def fetch_with_jina(
         links = list(links_data.keys())[:50]
 
     return ExtractedContent(
-        content=data.get("content", ""),
+        content=content,
         title=data.get("title", ""),
         url=data.get("url", url),
         date=data.get("publishedTime", ""),
@@ -980,7 +1029,7 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.0.0",
+    "User-Agent": "free-web-tools-mcp/5.1.0",
 }
 
 
@@ -1752,12 +1801,11 @@ def format_search_results(results: list[SearchResult], query: str, tool_name: st
     if not results:
         return f"## {tool_name}: {query}\n\nNo results found. Try rephrasing or simplifying the query."
 
-    source = results[0].source
-    source_labels = {"duckduckgo": "DuckDuckGo", "mojeek": "Mojeek", "bing": "Bing", "startpage": "Startpage"}
-    source_label = source_labels.get(source, source)
+    source_labels = {"duckduckgo": "DDG", "mojeek": "Mojeek", "bing": "Bing", "startpage": "Startpage"}
+    sources_used = sorted(set(source_labels.get(r.source, r.source) for r in results))
 
     lines = [f"## {tool_name}: {query} ({len(results)} results)\n"]
-    lines.append(f"*Source: {source_label}*\n")
+    lines.append(f"*Sources: {' + '.join(sources_used)}*\n")
 
     for i, r in enumerate(results, 1):
         domain = _extract_domain(r.url)
@@ -2016,7 +2064,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.0.0")
+server = Server("free-web-search", version="5.1.0")
 
 
 @server.list_tools()

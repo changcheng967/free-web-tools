@@ -74,14 +74,14 @@ claude mcp add free-web-search -- python -m mcp_server
 
 ## Architecture
 
-- **Search**: DuckDuckGo Lite + Mojeek + Bing + Startpage (4-way parallel race, first-wins)
+- **Search**: DuckDuckGo Lite + Mojeek + Bing + Startpage (4-way parallel, merge results — better coverage)
 - **Answer engine**: DuckDuckGo Instant Answer API + Wikipedia fallback (structured factual data)
 - **Encyclopedia**: Wikipedia REST Summary API (all languages)
 - **Comprehensive**: `auto_answer` combines instant answer + Wikipedia + web search (fault-tolerant)
 - **GitHub**: REST API (60 req/hr) + raw.githubusercontent.com (unlimited) for repo info, file content, issues/PRs, repo search
 - **Code search**: grep.app API (free, unlimited) for cross-repo code search
 - **Package registries**: PyPI JSON + npm Registry + crates.io API (all free, no keys)
-- **Content extraction**: Jina AI Reader JSON (with format/links options) -> trafilatura bare_extraction() -> BeautifulSoup
+- **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup
 - **Reliability**: Retry with exponential backoff, parallel backend racing, fallback chains
 - **Quality**: URL normalization (30+ tracking params), domain dedup, snippet capping, title cleaning, subdomain-aware filtering, smart truncation
 - **Performance**: Persistent HTTP/2 client, parallel search backends, parallel content fetch
