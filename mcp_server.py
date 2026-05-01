@@ -268,6 +268,10 @@ def clean_title(title: str) -> str:
     title = re.sub(r'^[\w\s.&-]+(?:\s*>\s*[\w\s.&-]+)+\s*>\s*', '', title)
     # Remove trailing paragraph markers from docs pages
     title = title.replace("¶", "").strip()
+    # Remove "Copy item path" and similar UI artifacts from docs.rs etc.
+    title = re.sub(r'\s*Copy\s+(item\s+)?path\s*$', '', title, flags=re.IGNORECASE)
+    # Remove " - Mozilla MDN" / " | MDN" suffixes
+    title = re.sub(r'\s*[-|]\s*(MDN|Mozilla\s+MDN|Mozilla\s+Developer\s+Network)\s*$', '', title, flags=re.IGNORECASE)
     # Collapse whitespace
     title = re.sub(r'\s+', ' ', title).strip()
     return title
@@ -1079,14 +1083,23 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
 
     if doc and doc.text:
         title = clean_title(doc.title or "")
-        # Fallback: extract title from HTML if trafilatura missed it
+        # Fallback: extract title from HTML if trafilatura missed it or gave garbage
         if not title:
             soup = BeautifulSoup(resp.text, "lxml")
-            h1 = soup.find("h1")
-            if h1:
-                title = clean_title(h1.get_text(strip=True))
-            elif soup.title and soup.title.string:
+            # Prefer <title> tag — h1 often includes UI artifacts
+            if soup.title and soup.title.string:
                 title = clean_title(soup.title.string.strip())
+            if not title:
+                h1 = soup.find("h1")
+                if h1:
+                    title = clean_title(h1.get_text(strip=True))
+        # If title looks like concatenated words (no spaces), try <title> tag
+        elif " " not in title and len(title) > 8:
+            soup = BeautifulSoup(resp.text, "lxml")
+            if soup.title and soup.title.string:
+                tag_title = clean_title(soup.title.string.strip())
+                if tag_title and " " in tag_title:
+                    title = tag_title
         return ExtractedContent(
             content=doc.text,
             title=title,
@@ -1106,11 +1119,12 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
         tag.decompose()
     text = soup.get_text(separator="\n", strip=True)
     title = ""
-    h1 = soup.find("h1")
-    if h1:
-        title = clean_title(h1.get_text(strip=True))
-    elif soup.title and soup.title.string:
+    if soup.title and soup.title.string:
         title = clean_title(soup.title.string.strip())
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = clean_title(h1.get_text(strip=True))
     return ExtractedContent(
         content=text,
         title=title,
