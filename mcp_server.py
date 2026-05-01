@@ -892,23 +892,30 @@ async def fetch_with_jina(
     if with_links:
         headers["X-With-Links-Summary"] = "true"
 
+    data = {}
+    content = ""
     for attempt in range(2):
-        resp = await client.get(
-            f"{JINA_READER_URL}/{url}",
-            headers=headers,
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        content = data.get("content", "")
+        try:
+            resp = await client.get(
+                f"{JINA_READER_URL}/{url}",
+                headers=headers,
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", "")
 
-        # If first attempt returns empty, retry with forced refresh
-        if not content.strip() and attempt == 0:
-            headers["X-No-Cache"] = "true"
-            headers["X-With-Generated-Alt"] = "true"
-            continue
-
-        break
+            # If first attempt returns empty, retry with forced refresh
+            if not content.strip() and attempt == 0:
+                headers["X-No-Cache"] = "true"
+                headers["X-With-Generated-Alt"] = "true"
+                continue
+            break
+        except Exception as exc:
+            if attempt == 0:
+                logger.warning("Jina attempt %d failed: %s", attempt + 1, exc)
+                continue
+            raise
 
     # Extract links if present
     links = None
@@ -936,7 +943,8 @@ async def fetch_with_jina(
 
 async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> ExtractedContent:
     """Fetch and extract content using trafilatura bare_extraction for metadata."""
-    resp = await client.get(url, timeout=15.0)
+    # Use browser-like headers to avoid bot-blocking (Wikipedia, SO, etc.)
+    resp = await client.get(url, headers=_search_headers(), timeout=15.0, follow_redirects=True)
     resp.raise_for_status()
 
     # Use the already-fetched HTML instead of fetching again
@@ -967,6 +975,68 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
         url=url,
         extraction_method="beautifulsoup",
     )
+
+
+# ---------------------------------------------------------------------------
+# StackOverflow — API fallback (direct fetch is 403'd)
+# ---------------------------------------------------------------------------
+
+async def _fetch_stackoverflow(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
+    """Fetch StackOverflow Q&A via StackExchange API (free, no key needed)."""
+    match = re.search(r'stackoverflow\.com/questions/(\d+)', url)
+    if not match:
+        return None
+    qid = match.group(1)
+
+    try:
+        # Fetch question
+        resp = await client.get(
+            "https://api.stackexchange.com/2.3/questions/{qid}",
+            params={"order": "desc", "sort": "activity", "site": "stackoverflow", "filter": "withbody"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            return None
+
+        q = items[0]
+        title = q.get("title", "")
+        body = q.get("body", "")
+
+        # Fetch top answer
+        ans_resp = await client.get(
+            f"https://api.stackexchange.com/2.3/questions/{qid}/answers",
+            params={"order": "desc", "sort": "votes", "site": "stackoverflow", "filter": "withbody", "pagesize": "3"},
+            timeout=10.0,
+        )
+        ans_data = ans_resp.json()
+        answers = ans_data.get("items", [])
+
+        parts = [f"# {title}\n"]
+        parts.append(f"**Question** (score: {q.get('score', 0)}, answers: {q.get('answer_count', 0)})\n")
+        parts.append(body)
+
+        for i, a in enumerate(answers, 1):
+            score = a.get("score", 0)
+            accepted = " (accepted)" if a.get("is_accepted") else ""
+            parts.append(f"\n**Answer {i}** (score: {score}{accepted})\n")
+            parts.append(a.get("body", ""))
+
+        content = "\n".join(parts)
+        # Strip HTML tags from API response (returns HTML)
+        content = re.sub(r'<[^>]+>', '', content)
+
+        return ExtractedContent(
+            content=content,
+            title=title,
+            url=url,
+            extraction_method="stackoverflow_api",
+        )
+    except Exception as e:
+        logger.warning("StackOverflow API fetch failed: %s", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1727,9 +1797,15 @@ async def fetch_content(
 
     client = _get_shared_client()
 
-    # Arxiv-specific handling: Jina returns empty for arxiv HTML papers
+    # Site-specific handling
     if "arxiv.org" in url:
         ec = await _fetch_arxiv(client, url)
+        if ec and ec.content and len(ec.content.strip()) > 50:
+            ec.content = _smart_truncate(ec.content, max_length)
+            return ec
+
+    if "stackoverflow.com/questions/" in url:
+        ec = await _fetch_stackoverflow(client, url)
         if ec and ec.content and len(ec.content.strip()) > 50:
             ec.content = _smart_truncate(ec.content, max_length)
             return ec
