@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.1.0.
+"""Free Web Search MCP Server v5.2.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -680,10 +680,12 @@ async def _parallel_search(
     Waits up to 8 seconds for backends to respond. Merges results from all
     backends that responded, deduplicates by URL, and returns the best results.
     """
-    ddg_task = asyncio.create_task(search_ddg_lite(query, max_results, time_range, language))
-    mojeek_task = asyncio.create_task(search_mojeek(query, max_results, language))
-    bing_task = asyncio.create_task(search_bing(query, max_results, language, time_range))
-    startpage_task = asyncio.create_task(search_startpage(query, max_results, time_range))
+    # Request more from each backend so merged results are plentiful
+    fetch_count = max(max_results, 15)
+    ddg_task = asyncio.create_task(search_ddg_lite(query, fetch_count, time_range, language))
+    mojeek_task = asyncio.create_task(search_mojeek(query, fetch_count, language))
+    bing_task = asyncio.create_task(search_bing(query, fetch_count, language, time_range))
+    startpage_task = asyncio.create_task(search_startpage(query, fetch_count, time_range))
 
     all_tasks = {ddg_task, mojeek_task, bing_task, startpage_task}
 
@@ -854,15 +856,12 @@ async def get_wiki_summary(title: str, lang: str = "en") -> dict[str, Any]:
     encoded = urllib.parse.quote(title.replace(" ", "_"))
     url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{encoded}"
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(10.0, connect=5.0),
-        http1=True,
-    ) as client:
-        resp = await _retry_async(client.get, retries=1, url=url)
-        if resp.status_code == 404:
-            return {}
-        resp.raise_for_status()
-        return resp.json()
+    client = _get_shared_client()
+    resp = await _retry_async(client.get, retries=1, url=url, headers=_search_headers())
+    if resp.status_code == 404:
+        return {}
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -1099,7 +1098,7 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.1.0",
+    "User-Agent": "free-web-tools-mcp/5.2.0",
 }
 
 
@@ -1333,14 +1332,17 @@ async def code_search(
         params["filter[repo][0]"] = repo
 
     try:
-        resp = await client.get(
-            "https://grep.app/api/search",
-            params=params,
-            timeout=12.0,
-            headers={"User-Agent": "free-web-tools-mcp/5.0.0"},
+        data = await _retry_async(
+            lambda: client.get(
+                "https://grep.app/api/search",
+                params=params,
+                timeout=12.0,
+                headers={"User-Agent": "free-web-tools-mcp/5.1.0"},
+            ),
+            retries=2,
+            base_delay=2.0,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        data = data.json()
     except Exception as exc:
         raise RuntimeError(f"Code search failed: {exc}")
 
@@ -2140,7 +2142,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.1.0")
+server = Server("free-web-search", version="5.2.0")
 
 
 @server.list_tools()
