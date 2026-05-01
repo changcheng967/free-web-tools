@@ -991,7 +991,7 @@ async def _fetch_stackoverflow(client: httpx.AsyncClient, url: str) -> Extracted
     try:
         # Fetch question
         resp = await client.get(
-            "https://api.stackexchange.com/2.3/questions/{qid}",
+            f"https://api.stackexchange.com/2.3/questions/{qid}",
             params={"order": "desc", "sort": "activity", "site": "stackoverflow", "filter": "withbody"},
             timeout=10.0,
         )
