@@ -50,7 +50,7 @@ claude mcp add free-web-search -- python -m mcp_server
 
 **`news_search`** — Like `web_search` but defaults to `time_range="week"`.
 
-**`fetch_url`** — Extract content from any URL. Returns Markdown (or plain text) with metadata header (Title | Author | Site | Date | Language | Method). Optional `with_links=true` appends all hyperlinks found on the page.
+**`fetch_url`** — Extract content from any URL. Returns Markdown (or plain text) with metadata header (Title | Author | Site | Date | Language | Method). Optional `with_links=true` appends all hyperlinks found on the page. Handles PDFs (full text via pypdf), arXiv papers (full text via HTML rendering, with PDF fallback), and GitHub/PyPI/npm/crates.io/StackExchange via their APIs.
 
 **`deep_search`** — One-shot research: searches the web, fetches full content from top 3 results in parallel. Returns combined Markdown with numbered references.
 
@@ -88,21 +88,13 @@ claude mcp add free-web-search -- python -m mcp_server
 - **GitHub**: REST API (60 req/hr) + raw.githubusercontent.com (unlimited) for repo info, file content, issues/PRs, repo search
 - **Code search**: grep.app API (free, unlimited) for cross-repo code search
 - **Package registries**: PyPI JSON + npm Registry + crates.io API (all free, no keys)
-- **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv full-text via HTML rendering)
+- **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv full-text via HTML rendering, PDF text extraction via pypdf)
 - **Reliability**: Retry with exponential backoff, parallel backend racing, fallback chains
 - **Backend health**: search results show a `Backends 4/4` line (✓/✗ per engine) so a dead or rotted backend can't fail silently
 - **Caching**: in-memory TTL cache (search ~10 min, fetch ~30 min) for repeat lookups — faster, fewer rate-limits
 - **Quality**: URL normalization (30+ tracking params), domain dedup, snippet capping, title cleaning, subdomain-aware filtering, smart truncation
 - **Performance**: Persistent HTTP/2 client, parallel search backends, parallel content fetch
 - **Protocol**: MCP spec via official Python SDK, STDIO transport
-
-## Testing
-
-Network-free unit tests for the pure functions, TTL cache, and formatting logic:
-
-```bash
-python test_mcp_server.py   # or: pytest -q
-```
 
 ## Dependencies
 
@@ -111,3 +103,4 @@ All free, pip-installable:
 - `httpx[http2]` — Async HTTP client
 - `beautifulsoup4` + `lxml` — HTML parsing
 - `trafilatura` — Content extraction
+- `pypdf` — PDF text extraction

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.7.0.
+"""Free Web Search MCP Server v5.8.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -1149,6 +1149,13 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
     resp = await client.get(url, headers=_search_headers(), timeout=15.0, follow_redirects=True)
     resp.raise_for_status()
 
+    # PDF safety net: a PDF served without a .pdf URL would otherwise produce
+    # garbage from HTML parsing — extract its real text instead.
+    if _is_pdf_response(resp):
+        ec = _extract_pdf_text(resp.content, url)
+        if ec:
+            return ec
+
     # Use the already-fetched HTML instead of fetching again
     doc = trafilatura.bare_extraction(resp.text)
 
@@ -1202,6 +1209,71 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
         url=url,
         extraction_method="beautifulsoup",
     )
+
+
+# ---------------------------------------------------------------------------
+# PDF text extraction (pypdf) — most academic papers are PDFs
+# ---------------------------------------------------------------------------
+
+def _is_pdf_response(resp: httpx.Response) -> bool:
+    """True if an HTTP response is a PDF (by content-type header or %PDF magic)."""
+    ctype = resp.headers.get("content-type", "").lower()
+    return "application/pdf" in ctype or resp.content[:4] == b"%PDF"
+
+
+def _extract_pdf_text(data: bytes, url: str) -> ExtractedContent | None:
+    """Extract text from PDF bytes via pypdf (lazy import).
+
+    Returns None if the bytes aren't a PDF or yield no text. pypdf is imported
+    lazily so the dependency only loads when a PDF is actually fetched.
+    """
+    if not data or data[:4] != b"%PDF":
+        return None
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        logger.warning("pypdf not installed; cannot extract PDF text from %s", url)
+        return None
+    try:
+        import io
+        reader = PdfReader(io.BytesIO(data))
+        pages = [t for p in reader.pages if (t := (p.extract_text() or "").strip())]
+        body = "\n\n".join(pages)
+        if not body.strip():
+            return None
+        title = ""
+        try:
+            if reader.metadata and reader.metadata.title:
+                title = clean_title(str(reader.metadata.title))
+        except Exception:
+            pass
+        header = (
+            f"# {title or 'PDF document'}\n\n"
+            f"**Pages:** {len(reader.pages)}  **Source:** {url}\n\n"
+            f"## Extracted text\n\n"
+        )
+        return ExtractedContent(
+            content=header + body,
+            title=title or "PDF document",
+            url=url,
+            site_name="PDF",
+            extraction_method="pdf_pypdf",
+        )
+    except Exception as e:
+        logger.warning("PDF text extraction failed for %s: %s", url, e)
+        return None
+
+
+async def _fetch_pdf(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
+    """Download a PDF and extract its text via pypdf."""
+    try:
+        resp = await client.get(url, headers=_search_headers(), timeout=20.0, follow_redirects=True)
+        if resp.status_code != 200:
+            return None
+    except Exception as e:
+        logger.warning("PDF download failed for %s: %s", url, e)
+        return None
+    return _extract_pdf_text(resp.content, url)
 
 
 # ---------------------------------------------------------------------------
@@ -1302,7 +1374,7 @@ async def _arxiv_api_meta(client: httpx.AsyncClient, paper_id: str) -> dict | No
     try:
         resp = await client.get(
             f"http://export.arxiv.org/api/query?id_list={paper_id}",
-            headers={"User-Agent": "free-web-tools-mcp/5.7.0"},
+            headers={"User-Agent": "free-web-tools-mcp/5.8.0"},
             timeout=15.0,
             follow_redirects=True,
         )
@@ -1396,6 +1468,16 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
         if not body:
             body = await _arxiv_html_body(client, f"https://ar5iv.org/abs/{base_id}")
             source = "ar5iv"
+        # No HTML rendering at all (rare) — extract the paper's PDF directly.
+        if not body:
+            pdf_ec = await _fetch_pdf(client, f"https://arxiv.org/pdf/{base_id}")
+            if pdf_ec and pdf_ec.content:
+                if meta:
+                    pdf_ec.title = meta["title"] or pdf_ec.title
+                    pdf_ec.author = ", ".join(meta["authors"]) or pdf_ec.author
+                    pdf_ec.date = meta.get("published", "") or pdf_ec.date
+                pdf_ec.extraction_method = "arxiv_pdf"
+                return pdf_ec
 
     if meta:
         section = "Full text" if body else "Abstract"
@@ -1461,7 +1543,7 @@ async def _arxiv_abstract_scrape(client: httpx.AsyncClient, abs_url: str) -> Ext
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.7.0",
+    "User-Agent": "free-web-tools-mcp/5.8.0",
 }
 
 
@@ -2315,6 +2397,15 @@ async def _fetch_content_uncached(
                 raise
             logger.warning("crates.io API fetch failed for %s: %s", url, e)
 
+    # PDF documents (non-arXiv; arXiv /pdf/ is handled by the adapter above) ->
+    # text extraction via pypdf. Catches both .pdf URLs and /pdf/ paths.
+    _low = url.lower()
+    if _low.endswith(".pdf") or _low.rstrip("/").endswith(".pdf") or "/pdf/" in _low:
+        ec = await _fetch_pdf(client, url)
+        if ec and ec.content and len(ec.content.strip()) > 50:
+            ec.content = _smart_truncate(ec.content, max_length)
+            return ec
+
     try:
         ec = await fetch_with_jina(client, url, return_format, with_links)
         if ec.content and len(ec.content.strip()) > 100:
@@ -2664,7 +2755,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.7.0")
+server = Server("free-web-search", version="5.8.0")
 
 
 @server.list_tools()
