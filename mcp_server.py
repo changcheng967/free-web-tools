@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.6.0.
+"""Free Web Search MCP Server v5.7.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -9,8 +9,10 @@ No API keys required.
 """
 
 import asyncio
+import copy
 import logging
 import re
+import time
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
@@ -192,6 +194,45 @@ async def _retry_async(
             delay = base_delay * (2 ** attempt)
             await asyncio.sleep(delay)
     raise last_exc  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Result cache (in-memory TTL) — speeds repeat lookups within a session
+# ---------------------------------------------------------------------------
+
+_CACHE_MISS = object()
+# Short TTLs: search results and pages change, but within a research session the
+# same query/URL is often re-fetched; caching avoids redundant network + scraping.
+_SEARCH_CACHE_TTL = 600.0   # 10 minutes
+_FETCH_CACHE_TTL = 1800.0   # 30 minutes
+
+
+class _TTLCache:
+    """Tiny in-memory TTL cache with a max-size cap (oldest evicted)."""
+
+    def __init__(self, max_entries: int = 256) -> None:
+        self._store: dict[tuple, tuple[float, float, Any]] = {}
+        self._max = max_entries
+
+    def get(self, key: tuple) -> Any:
+        entry = self._store.get(key)
+        if entry is None:
+            return _CACHE_MISS
+        ts, ttl, val = entry
+        if time.monotonic() - ts > ttl:
+            self._store.pop(key, None)
+            return _CACHE_MISS
+        return val
+
+    def set(self, key: tuple, val: Any, ttl: float) -> None:
+        if len(self._store) >= self._max:
+            oldest = min(self._store, key=lambda k: self._store[k][0])
+            self._store.pop(oldest, None)
+        self._store[key] = (time.monotonic(), ttl, val)
+
+
+_search_cache = _TTLCache()
+_fetch_cache = _TTLCache()
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +666,10 @@ async def search_bing(
         timeout=httpx.Timeout(15.0, connect=8.0),
         http1=True,
     ) as client:
-        resp = await _retry_async(client.get, retries=1, url="https://www.bing.com/search", params=params)
+        # Use the bare host: bing.com/search redirects through Bing's &toWww path
+        # and serves full results, whereas www.bing.com/search serves a Cloudflare
+        # Turnstile bot-challenge page to scrapers.
+        resp = await _retry_async(client.get, retries=1, url="https://bing.com/search", params=params)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "lxml")
@@ -683,20 +727,30 @@ async def _parallel_search(
     max_results: int = 10,
     time_range: str | None = None,
     language: str | None = None,
-) -> list[SearchResult]:
+) -> tuple[list[SearchResult], dict[str, int]]:
     """Race all 4 search backends in parallel; merge and dedup results.
 
     Waits up to 8 seconds for backends to respond. Merges results from all
     backends that responded, deduplicates by URL, and returns the best results.
+
+    Returns ``(results, source_counts)`` where source_counts maps each backend to
+    how many results it returned (pre-dedup) — used to surface backend health so a
+    dead/rotted backend can't fail silently.
     """
+    cache_key = ("search", query.lower().strip(), max_results, time_range or "", language or "")
+    hit = _search_cache.get(cache_key)
+    if hit is not _CACHE_MISS:
+        return hit
+
     # Request more from each backend so merged results are plentiful
     fetch_count = max(max_results, 15)
-    ddg_task = asyncio.create_task(search_ddg_lite(query, fetch_count, time_range, language))
-    mojeek_task = asyncio.create_task(search_mojeek(query, fetch_count, language))
-    bing_task = asyncio.create_task(search_bing(query, fetch_count, language, time_range))
-    startpage_task = asyncio.create_task(search_startpage(query, fetch_count, time_range))
-
-    all_tasks = {ddg_task, mojeek_task, bing_task, startpage_task}
+    task_sources = {
+        asyncio.create_task(search_ddg_lite(query, fetch_count, time_range, language)): "duckduckgo",
+        asyncio.create_task(search_mojeek(query, fetch_count, language)): "mojeek",
+        asyncio.create_task(search_bing(query, fetch_count, language, time_range)): "bing",
+        asyncio.create_task(search_startpage(query, fetch_count, time_range)): "startpage",
+    }
+    all_tasks = set(task_sources)
 
     # Wait for all backends with 8-second timeout
     done, pending = await asyncio.wait(all_tasks, timeout=8.0)
@@ -711,15 +765,21 @@ async def _parallel_search(
         except (asyncio.CancelledError, Exception):
             pass
 
-    # Collect results from all completed backends
+    # Collect results + per-backend counts (pre-dedup, so a healthy backend that
+    # gets interleaved out of the final list still counts as ✓).
     all_results: list[SearchResult] = []
+    source_counts: dict[str, int] = {}
     for t in done:
+        src = task_sources[t]
         try:
             results = t.result()
+            n = len(results) if results else 0
+            source_counts[src] = n
             if results:
                 all_results.extend(results)
         except Exception as exc:
-            logger.warning("Search backend failed: %s", exc)
+            source_counts[src] = 0
+            logger.warning("Search backend %s failed: %s", src, exc)
 
     # Dedup by normalized URL, keeping the result with the longest snippet.
     # Track which sources saw each URL for cross-validation scoring.
@@ -755,7 +815,9 @@ async def _parallel_search(
             if not group:
                 del by_source[source]
 
-    return merged
+    result = (merged, source_counts)
+    _search_cache.set(cache_key, result, _SEARCH_CACHE_TTL)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1240,7 +1302,7 @@ async def _arxiv_api_meta(client: httpx.AsyncClient, paper_id: str) -> dict | No
     try:
         resp = await client.get(
             f"http://export.arxiv.org/api/query?id_list={paper_id}",
-            headers={"User-Agent": "free-web-tools-mcp/5.6.0"},
+            headers={"User-Agent": "free-web-tools-mcp/5.7.0"},
             timeout=15.0,
             follow_redirects=True,
         )
@@ -1399,7 +1461,7 @@ async def _arxiv_abstract_scrape(client: httpx.AsyncClient, abs_url: str) -> Ext
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.6.0",
+    "User-Agent": "free-web-tools-mcp/5.7.0",
 }
 
 
@@ -2102,6 +2164,27 @@ async def fetch_content(
     return_format: str = "markdown",
     with_links: bool = False,
 ) -> ExtractedContent:
+    """Fetch readable content from a URL (cached wrapper).
+
+    Caches successful extractions for ~30 minutes so repeated fetches of the same
+    URL (common in research sessions) don't re-hit the network. Errors are not
+    cached. See ``_fetch_content_uncached`` for the actual extraction logic.
+    """
+    cache_key = ("fetch", url, return_format, with_links, max_length)
+    hit = _fetch_cache.get(cache_key)
+    if hit is not _CACHE_MISS:
+        return copy.copy(hit)
+    ec = await _fetch_content_uncached(url, max_length, return_format, with_links)
+    _fetch_cache.set(cache_key, ec, _FETCH_CACHE_TTL)
+    return ec
+
+
+async def _fetch_content_uncached(
+    url: str,
+    max_length: int = 15000,
+    return_format: str = "markdown",
+    with_links: bool = False,
+) -> ExtractedContent:
     """Fetch readable content from a URL with arxiv-aware -> Jina JSON -> trafilatura fallback."""
     if not url.startswith(("http://", "https://")):
         raise ValueError(f"Invalid URL scheme: {url}. Must start with http:// or https://")
@@ -2227,7 +2310,9 @@ async def fetch_content(
                 site_name="crates.io",
                 extraction_method="crates_api",
             )
-        except Exception as e:
+        except RuntimeError as e:
+            if "not found" in str(e).lower():
+                raise
             logger.warning("crates.io API fetch failed for %s: %s", url, e)
 
     try:
@@ -2290,16 +2375,30 @@ def _apply_domain_filter(
 # Format helpers (Markdown, LLM-optimized)
 # ---------------------------------------------------------------------------
 
-def format_search_results(results: list[SearchResult], query: str, tool_name: str = "web_search") -> str:
+def format_search_results(
+    results: list[SearchResult],
+    query: str,
+    tool_name: str = "web_search",
+    source_counts: dict[str, int] | None = None,
+) -> str:
     """Format search results into Markdown for LLM consumption."""
     if not results:
         return f"## {tool_name}: {query}\n\nNo results found. Try rephrasing or simplifying the query."
 
     source_labels = {"duckduckgo": "DDG", "mojeek": "Mojeek", "bing": "Bing", "startpage": "Startpage"}
-    sources_used = sorted(set(source_labels.get(r.source, r.source) for r in results))
+    _order = ["duckduckgo", "mojeek", "bing", "startpage"]
+    # Prefer pre-dedup counts (accurate even when a healthy backend's results get
+    # interleaved out of the final list); fall back to inferring from visible results.
+    if source_counts:
+        up = sum(1 for s in _order if source_counts.get(s))
+        marks = [f"{source_labels[s]} {'✓' if source_counts.get(s) else '✗'}" for s in _order]
+    else:
+        contributed = {r.source for r in results if r.source}
+        up = sum(1 for s in _order if s in contributed)
+        marks = [f"{source_labels[s]} {'✓' if s in contributed else '✗'}" for s in _order]
 
     lines = [f"## {tool_name}: {query} ({len(results)} results)\n"]
-    lines.append(f"*Sources: {' + '.join(sources_used)}*\n")
+    lines.append(f"*Backends {up}/{len(_order)}: {'  '.join(marks)}*\n")
 
     for i, r in enumerate(results, 1):
         domain = _extract_domain(r.url)
@@ -2565,7 +2664,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.6.0")
+server = Server("free-web-search", version="5.7.0")
 
 
 @server.list_tools()
@@ -3146,7 +3245,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                     else:
                         include_domains = site_domains
 
-                results = await _parallel_search(clean_query, max_results, time_range, language)
+                results, source_counts = await _parallel_search(clean_query, max_results, time_range, language)
                 results = post_process_results(results)
                 results = _apply_domain_filter(results, include_domains, exclude_domains)
                 if not results:
@@ -3154,7 +3253,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                         f"No results found for: {clean_query}. "
                         "Try rephrasing, simplifying the query, or removing domain filters."
                     )
-                return [TextContent(type="text", text=format_search_results(results, clean_query, "web_search"))]
+                return [TextContent(type="text", text=format_search_results(results, clean_query, "web_search", source_counts))]
             except Exception as e:
                 return error_result(f"Search error: {e}")
 
@@ -3179,7 +3278,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                     else:
                         include_domains = site_domains
 
-                results = await _parallel_search(clean_query, max_results, time_range, language)
+                results, source_counts = await _parallel_search(clean_query, max_results, time_range, language)
                 results = post_process_results(results)
                 results = _apply_domain_filter(results, include_domains, exclude_domains)
                 if not results:
@@ -3187,7 +3286,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                         f"No results found for: {clean_query}. "
                         "Try rephrasing, simplifying the query, or removing domain filters."
                     )
-                return [TextContent(type="text", text=format_search_results(results, clean_query, "news_search"))]
+                return [TextContent(type="text", text=format_search_results(results, clean_query, "news_search", source_counts))]
             except Exception as e:
                 return error_result(f"News search error: {e}")
 
@@ -3218,7 +3317,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
 
             try:
                 # Step 1: Search
-                results = await _parallel_search(query, max(5, num_results * 2), time_range, language)
+                results, _source_counts = await _parallel_search(query, max(5, num_results * 2), time_range, language)
                 results = post_process_results(results)
                 if not results:
                     return error_result(f"No results found for: {query}")
@@ -3357,8 +3456,8 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                         logger.warning("auto_answer: wiki_search fallback failed: %s", e)
 
                 search_results = []
-                if isinstance(gathered[2], list):
-                    search_results = gathered[2]
+                if isinstance(gathered[2], tuple):
+                    search_results = gathered[2][0]
                 elif isinstance(gathered[2], Exception):
                     logger.warning("auto_answer: search failed: %s", gathered[2])
 

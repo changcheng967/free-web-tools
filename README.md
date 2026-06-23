@@ -90,9 +90,19 @@ claude mcp add free-web-search -- python -m mcp_server
 - **Package registries**: PyPI JSON + npm Registry + crates.io API (all free, no keys)
 - **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv full-text via HTML rendering)
 - **Reliability**: Retry with exponential backoff, parallel backend racing, fallback chains
+- **Backend health**: search results show a `Backends 4/4` line (✓/✗ per engine) so a dead or rotted backend can't fail silently
+- **Caching**: in-memory TTL cache (search ~10 min, fetch ~30 min) for repeat lookups — faster, fewer rate-limits
 - **Quality**: URL normalization (30+ tracking params), domain dedup, snippet capping, title cleaning, subdomain-aware filtering, smart truncation
 - **Performance**: Persistent HTTP/2 client, parallel search backends, parallel content fetch
 - **Protocol**: MCP spec via official Python SDK, STDIO transport
+
+## Testing
+
+Network-free unit tests for the pure functions, TTL cache, and formatting logic:
+
+```bash
+python test_mcp_server.py   # or: pytest -q
+```
 
 ## Dependencies
 
