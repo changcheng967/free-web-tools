@@ -88,7 +88,7 @@ claude mcp add free-web-search -- python -m mcp_server
 - **GitHub**: REST API (60 req/hr) + raw.githubusercontent.com (unlimited) for repo info, file content, issues/PRs, repo search
 - **Code search**: grep.app API (free, unlimited) for cross-repo code search
 - **Package registries**: PyPI JSON + npm Registry + crates.io API (all free, no keys)
-- **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv)
+- **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv full-text via HTML rendering)
 - **Reliability**: Retry with exponential backoff, parallel backend racing, fallback chains
 - **Quality**: URL normalization (30+ tracking params), domain dedup, snippet capping, title cleaning, subdomain-aware filtering, smart truncation
 - **Performance**: Persistent HTTP/2 client, parallel search backends, parallel content fetch

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.5.0.
+"""Free Web Search MCP Server v5.6.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -1231,40 +1231,151 @@ async def _fetch_stackexchange(client: httpx.AsyncClient, url: str) -> Extracted
 # Arxiv-specific content extraction
 # ---------------------------------------------------------------------------
 
-async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
-    """Extract content from arxiv papers via direct HTML parsing of /abs/ page."""
-    # Convert /html/ to /abs/ for reliable parsing
-    abs_url = re.sub(r'arxiv\.org/html/', 'arxiv.org/abs/', url)
+async def _arxiv_api_meta(client: httpx.AsyncClient, paper_id: str) -> dict | None:
+    """Fetch clean metadata from the official arXiv API (Atom feed).
 
+    Returns title, ALL authors, abstract, and published date — far more reliable
+    than scraping HTML author markup (which is incomplete on arXiv/ar5iv renderings).
+    """
     try:
-        resp = await client.get(abs_url, timeout=15.0)
+        resp = await client.get(
+            f"http://export.arxiv.org/api/query?id_list={paper_id}",
+            headers={"User-Agent": "free-web-tools-mcp/5.6.0"},
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "xml")
+        entry = soup.find("entry")
+        if not entry:
+            return None
+        title_el = entry.find("title")
+        title = clean_title(title_el.get_text(strip=True)) if title_el else ""
+        authors = [a.find("name").get_text(strip=True) for a in entry.find_all("author") if a.find("name")]
+        summary = entry.find("summary")
+        abstract = summary.get_text(strip=True) if summary else ""
+        pub = entry.find("published")
+        published = pub.get_text(strip=True)[:10] if pub else ""
+        if not title and not abstract:
+            return None
+        return {"title": title, "authors": authors, "abstract": abstract, "published": published}
+    except Exception as e:
+        logger.warning("arXiv API meta failed for %s: %s", paper_id, e)
+        return None
+
+
+async def _arxiv_html_body(client: httpx.AsyncClient, html_url: str) -> str | None:
+    """Extract a paper's full body text from an HTML rendering (arXiv or ar5iv)."""
+    try:
+        resp = await client.get(html_url, headers=_search_headers(), timeout=20.0, follow_redirects=True)
+        if resp.status_code != 200 or len(resp.text) < 2000:
+            return None
+    except Exception as e:
+        logger.warning("arXiv HTML body fetch failed for %s: %s", html_url, e)
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    # Strip bibliography + page chrome so the paper body fills the length budget
+    for sel in ("script", "style", "nav", "footer", "header", "aside",
+                ".ltx_bibliography", ".ltx_page_footer", ".ltx_page_header"):
+        for el in soup.select(sel):
+            el.decompose()
+    article = soup.find("article") or soup.select_one(".ltx_document") or soup.body or soup
+    doc = trafilatura.bare_extraction(str(article))
+    body = (doc.text if doc and doc.text else "").strip()
+    if len(body) < 400:
+        body = article.get_text(separator="\n", strip=True)
+    return body if len(body) >= 400 else None
+
+
+def _arxiv_header(meta: dict, abs_url: str, section: str) -> list[str]:
+    """Build the metadata header lines for an arXiv paper."""
+    parts: list[str] = [f"# {meta['title']}\n"] if meta.get("title") else []
+    if meta.get("authors"):
+        parts.append(f"**Authors:** {', '.join(meta['authors'])}\n")
+    parts.append(f"**arXiv:** {abs_url}\n")
+    parts.append(f"**PDF:** {abs_url.replace('/abs/', '/pdf/')}\n")
+    if meta.get("published"):
+        parts.append(f"**Published:** {meta['published']}\n")
+    parts.append(f"\n## {section}\n")
+    return parts
+
+
+async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent | None:
+    """Extract an arXiv paper, preferring full text over abstract.
+
+    Metadata (title, all authors, abstract, date) comes from the official arXiv API;
+    the full body text comes from the arXiv HTML rendering (with ar5iv as a fallback
+    for papers without an official HTML version). Falls back to the /abs/ page scrape
+    if the API is unreachable.
+    """
+    # Parse the arXiv id (new-style 2301.00001 or old-style hep-th/9901001), with
+    # optional version suffix. Falls back to a best-effort /html/ -> /abs/ rewrite.
+    id_match = re.search(
+        r'arxiv\.org/(?:abs|html|pdf)/(?P<id>(?:[a-z\-]+/\d{7})|(?:\d{4}\.\d{4,5}))(?P<ver>v\d+)?',
+        url, re.IGNORECASE,
+    )
+    if id_match:
+        base_id = id_match.group("id")
+        paper_id = base_id + (id_match.group("ver") or "")
+        abs_url = f"https://arxiv.org/abs/{base_id}"
+    else:
+        base_id = paper_id = ""
+        abs_url = re.sub(r'arxiv\.org/html/', 'arxiv.org/abs/', url)
+
+    # Metadata backbone (authoritative: complete author list, title, abstract, date)
+    meta = await _arxiv_api_meta(client, paper_id or base_id) if (paper_id or base_id) else None
+
+    # Full body text from HTML renderings
+    body: str | None = None
+    source = "arxiv_html"
+    if paper_id:
+        body = await _arxiv_html_body(client, f"https://arxiv.org/html/{paper_id}")
+        if not body:
+            body = await _arxiv_html_body(client, f"https://ar5iv.org/abs/{base_id}")
+            source = "ar5iv"
+
+    if meta:
+        section = "Full text" if body else "Abstract"
+        parts = _arxiv_header(meta, abs_url, section)
+        parts.append("\n" + (body if body else meta.get("abstract", "")))
+        return ExtractedContent(
+            content="\n".join(parts),
+            title=meta["title"],
+            url=abs_url,
+            author=", ".join(meta["authors"]),
+            date=meta.get("published", ""),
+            description=(meta.get("abstract") or "")[:300],
+            site_name="arXiv",
+            extraction_method=f"arxiv_{source}" if body else "arxiv_api",
+        )
+
+    # API unreachable — last-resort scrape of the /abs/ page
+    return await _arxiv_abstract_scrape(client, abs_url)
+
+
+async def _arxiv_abstract_scrape(client: httpx.AsyncClient, abs_url: str) -> ExtractedContent | None:
+    """Emergency fallback: scrape title + abstract from the /abs/ page when the API fails."""
+    try:
+        resp = await client.get(abs_url, headers=_search_headers(), timeout=15.0, follow_redirects=True)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Extract metadata
         title_el = soup.select_one("h1.title, .title")
         abstract_el = soup.select_one("blockquote.abstract, .abstract")
         author_els = soup.select("div.authors a")
 
-        title = ""
-        if title_el:
-            title = title_el.get_text(strip=True).replace("Title:", "").strip()
-
-        abstract = ""
-        if abstract_el:
-            abstract = abstract_el.get_text(strip=True).replace("Abstract:", "").strip()
-
+        title = title_el.get_text(strip=True).replace("Title:", "").strip() if title_el else ""
+        abstract = abstract_el.get_text(strip=True).replace("Abstract:", "").strip() if abstract_el else ""
         authors = ", ".join(a.get_text(strip=True) for a in author_els[:10])
 
         if not title and not abstract:
             return None
 
-        content_parts = []
-        if title:
-            content_parts.append(f"# {title}\n")
+        content_parts = [f"# {title}\n"] if title else []
         if authors:
             content_parts.append(f"**Authors:** {authors}\n")
-        content_parts.append(f"**URL:** {abs_url}\n")
+        content_parts.append(f"**arXiv:** {abs_url}\n")
         content_parts.append(f"**PDF:** {abs_url.replace('/abs/', '/pdf/')}\n")
         if abstract:
             content_parts.append(f"\n## Abstract\n\n{abstract}")
@@ -1272,12 +1383,13 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
         return ExtractedContent(
             content="\n".join(content_parts),
             title=title,
-            url=url,
+            url=abs_url,
             author=authors,
-            extraction_method="arxiv_direct",
+            site_name="arXiv",
+            extraction_method="arxiv_abstract",
         )
     except Exception as e:
-        logger.warning("Arxiv direct fetch failed: %s", e)
+        logger.warning("Arxiv abstract scrape failed for %s: %s", abs_url, e)
         return None
 
 
@@ -1287,7 +1399,7 @@ async def _fetch_arxiv(client: httpx.AsyncClient, url: str) -> ExtractedContent 
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.5.0",
+    "User-Agent": "free-web-tools-mcp/5.6.0",
 }
 
 
@@ -2081,7 +2193,9 @@ async def fetch_content(
                 site_name="PyPI",
                 extraction_method="pypi_api",
             )
-        except Exception as e:
+        except RuntimeError as e:
+            if "not found" in str(e).lower():
+                raise
             logger.warning("PyPI API fetch failed for %s: %s", url, e)
 
     # npm package pages -> structured API data
@@ -2096,7 +2210,9 @@ async def fetch_content(
                 site_name="npm",
                 extraction_method="npm_api",
             )
-        except Exception as e:
+        except RuntimeError as e:
+            if "not found" in str(e).lower():
+                raise
             logger.warning("npm API fetch failed for %s: %s", url, e)
 
     # crates.io package pages -> structured API data
@@ -2449,7 +2565,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.5.0")
+server = Server("free-web-search", version="5.6.0")
 
 
 @server.list_tools()
