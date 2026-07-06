@@ -88,7 +88,7 @@ claude mcp add free-web-search -- python -m mcp_server
 - **GitHub**: REST API (60 req/hr) + raw.githubusercontent.com (unlimited) for repo info, file content, issues/PRs, repo search
 - **Code search**: grep.app API (free, unlimited) for cross-repo code search
 - **Package registries**: PyPI JSON + npm Registry + crates.io API (all free, no keys)
-- **Content extraction**: Jina AI Reader (JS-rendered pages, retries on empty) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv full-text via HTML rendering, PDF text extraction via pypdf)
+- **Content extraction**: curl_cffi (Chrome TLS impersonation, primary — bypasses Cloudflare) -> Jina AI Reader (JS-rendered pages, retries on rate-limit) -> trafilatura -> BeautifulSoup, with smart URL routing (GitHub API, PyPI/npm/crates.io APIs, StackExchange API for all SE sites, arXiv full-text via HTML rendering, PDF text extraction via pypdf)
 - **Reliability**: Retry with exponential backoff, parallel backend racing, fallback chains
 - **Backend health**: search results show a `Backends 4/4` line (✓/✗ per engine) so a dead or rotted backend can't fail silently
 - **Caching**: in-memory TTL cache (search ~10 min, fetch ~30 min) for repeat lookups — faster, fewer rate-limits
@@ -104,3 +104,4 @@ All free, pip-installable:
 - `beautifulsoup4` + `lxml` — HTML parsing
 - `trafilatura` — Content extraction
 - `pypdf` — PDF text extraction
+- `curl_cffi` — Chrome TLS impersonation to bypass Cloudflare/bot-blocks

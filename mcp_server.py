@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.8.0.
+"""Free Web Search MCP Server v5.9.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -1081,7 +1081,9 @@ async def fetch_with_jina(
     """Fetch content via Jina AI Reader JSON mode (handles JS-rendered pages).
 
     Jina Reader renders JavaScript server-side, making it the primary method
-    for pages that require JS. Retries once with cache-bypass on empty content.
+    for pages that require JS. Retries up to 4× with exponential backoff on
+    rate-limits (401/429) and empty content, since Jina is the only chain step
+    that bypasses Cloudflare/JS — giving up early means losing the page entirely.
 
     Args:
         return_format: 'markdown', 'text', or 'html'
@@ -1097,26 +1099,39 @@ async def fetch_with_jina(
 
     data = {}
     content = ""
-    for attempt in range(2):
+    # Jina is the only path that renders JS / bypasses Cloudflare, so it's worth
+    # retrying through its transient rate-limits (it returns 401/429 when throttled)
+    # and empty-content responses before giving up and falling through to trafilatura.
+    max_attempts = 4
+    for attempt in range(max_attempts):
         try:
             resp = await client.get(
                 f"{JINA_READER_URL}/{url}",
                 headers=headers,
                 timeout=30.0,
             )
+            # Transient rate-limit: back off and retry (clears within a few seconds).
+            if resp.status_code in (401, 429) and attempt < max_attempts - 1:
+                delay = 1.0 * (2 ** attempt)
+                logger.warning("Jina rate-limited (HTTP %d) for %s; retry %d/%d in %.1fs",
+                               resp.status_code, url, attempt + 1, max_attempts - 1, delay)
+                await asyncio.sleep(delay)
+                continue
             resp.raise_for_status()
             data = resp.json()
             content = data.get("content", "")
 
-            # If first attempt returns empty, retry with forced refresh
-            if not content.strip() and attempt == 0:
+            # Empty content: retry with cache-bypass on a non-final attempt.
+            if not content.strip() and attempt < max_attempts - 1:
                 headers["X-No-Cache"] = "true"
                 headers["X-With-Generated-Alt"] = "true"
+                await asyncio.sleep(1.0)
                 continue
             break
-        except Exception as exc:
-            if attempt == 0:
-                logger.warning("Jina attempt %d failed: %s", attempt + 1, exc)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            if attempt < max_attempts - 1:
+                logger.warning("Jina transient error (attempt %d): %s", attempt + 1, exc)
+                await asyncio.sleep(1.0 * (2 ** attempt))
                 continue
             raise
 
@@ -1143,27 +1158,19 @@ async def fetch_with_jina(
 # Trafilatura — content extraction (local fallback, rich metadata)
 # ---------------------------------------------------------------------------
 
-async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> ExtractedContent:
-    """Fetch and extract content using trafilatura bare_extraction for metadata."""
-    # Use browser-like headers to avoid bot-blocking (Wikipedia, SO, etc.)
-    resp = await client.get(url, headers=_search_headers(), timeout=15.0, follow_redirects=True)
-    resp.raise_for_status()
+def _extract_from_html(html: str, url: str, method: str = "trafilatura") -> ExtractedContent:
+    """Extract readable content + metadata from an HTML string.
 
-    # PDF safety net: a PDF served without a .pdf URL would otherwise produce
-    # garbage from HTML parsing — extract its real text instead.
-    if _is_pdf_response(resp):
-        ec = _extract_pdf_text(resp.content, url)
-        if ec:
-            return ec
-
-    # Use the already-fetched HTML instead of fetching again
-    doc = trafilatura.bare_extraction(resp.text)
+    Shared extraction core (trafilatura first, then title fallbacks, then a
+    BeautifulSoup text pass) used by both the httpx fetch path and curl_cffi.
+    """
+    doc = trafilatura.bare_extraction(html)
 
     if doc and doc.text:
         title = clean_title(doc.title or "")
         # Fallback: extract title from HTML if trafilatura missed it or gave garbage
         if not title:
-            soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(html, "lxml")
             # Prefer <title> tag — h1 often includes UI artifacts
             if soup.title and soup.title.string:
                 title = clean_title(soup.title.string.strip())
@@ -1173,7 +1180,7 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
                     title = clean_title(h1.get_text(strip=True))
         # If title looks like concatenated words (no spaces), try <title> tag
         elif " " not in title and len(title) > 8:
-            soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(html, "lxml")
             if soup.title and soup.title.string:
                 tag_title = clean_title(soup.title.string.strip())
                 if tag_title and " " in tag_title:
@@ -1187,11 +1194,11 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
             description=doc.description or "",
             author=doc.author or "",
             site_name=doc.sitename or "",
-            extraction_method="trafilatura",
+            extraction_method=method,
         )
 
     # Final fallback: BeautifulSoup text extraction with expanded tag stripping
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside",
                      "form", "iframe", "noscript", "svg", "table", "button"]):
         tag.decompose()
@@ -1207,8 +1214,24 @@ async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> Extract
         content=text,
         title=title,
         url=url,
-        extraction_method="beautifulsoup",
+        extraction_method="beautifulsoup" if method == "trafilatura" else f"{method}+bs4",
     )
+
+
+async def fetch_with_trafilatura(client: httpx.AsyncClient, url: str) -> ExtractedContent:
+    """Fetch and extract content using trafilatura bare_extraction for metadata."""
+    # Use browser-like headers to avoid bot-blocking (Wikipedia, SO, etc.)
+    resp = await client.get(url, headers=_search_headers(), timeout=15.0, follow_redirects=True)
+    resp.raise_for_status()
+
+    # PDF safety net: a PDF served without a .pdf URL would otherwise produce
+    # garbage from HTML parsing — extract its real text instead.
+    if _is_pdf_response(resp):
+        ec = _extract_pdf_text(resp.content, url)
+        if ec:
+            return ec
+
+    return _extract_from_html(resp.text, url)
 
 
 # ---------------------------------------------------------------------------
@@ -1274,6 +1297,37 @@ async def _fetch_pdf(client: httpx.AsyncClient, url: str) -> ExtractedContent | 
         logger.warning("PDF download failed for %s: %s", url, e)
         return None
     return _extract_pdf_text(resp.content, url)
+
+
+# ---------------------------------------------------------------------------
+# curl_cffi — primary generic fetch (Chrome TLS impersonation, beats Cloudflare)
+# ---------------------------------------------------------------------------
+
+async def _fetch_with_curl_cffi(url: str) -> ExtractedContent | None:
+    """Fetch with Chrome TLS/JA3 impersonation, then extract.
+
+    Local and fast, and bypasses Cloudflare's TLS-fingerprint challenges that
+    block plain httpx (e.g. Medium). Can't run JS, so JS-only pages fall through
+    to Jina. curl_cffi is imported lazily; returns None if unavailable/failed so
+    the chain continues.
+    """
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        logger.info("curl_cffi unavailable; skipping TLS-impersonation fetch")
+        return None
+    try:
+        async with AsyncSession(impersonate="chrome", timeout=20) as s:
+            resp = await s.get(url, headers=_search_headers(), allow_redirects=True)
+            if resp.status_code != 200:
+                return None
+            # PDF served without a .pdf URL: extract instead of returning garbage.
+            if resp.content[:4] == b"%PDF":
+                return _extract_pdf_text(resp.content, url)
+            return _extract_from_html(resp.text, url, method="curl_cffi")
+    except Exception as e:
+        logger.warning("curl_cffi fetch failed for %s: %s", url, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1374,7 +1428,7 @@ async def _arxiv_api_meta(client: httpx.AsyncClient, paper_id: str) -> dict | No
     try:
         resp = await client.get(
             f"http://export.arxiv.org/api/query?id_list={paper_id}",
-            headers={"User-Agent": "free-web-tools-mcp/5.8.0"},
+            headers={"User-Agent": "free-web-tools-mcp/5.9.0"},
             timeout=15.0,
             follow_redirects=True,
         )
@@ -1543,7 +1597,7 @@ async def _arxiv_abstract_scrape(client: httpx.AsyncClient, abs_url: str) -> Ext
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.8.0",
+    "User-Agent": "free-web-tools-mcp/5.9.0",
 }
 
 
@@ -2406,6 +2460,14 @@ async def _fetch_content_uncached(
             ec.content = _smart_truncate(ec.content, max_length)
             return ec
 
+    # Generic chain. curl_cffi is primary: local, fast, and bypasses Cloudflare
+    # TLS-fingerprinting (Medium, etc.). Jina renders JS as a fallback; trafilatura
+    # is the last resort for plain server-rendered HTML.
+    ec = await _fetch_with_curl_cffi(url)
+    if ec and ec.content and len(ec.content.strip()) > 50:
+        ec.content = _smart_truncate(ec.content, max_length)
+        return ec
+
     try:
         ec = await fetch_with_jina(client, url, return_format, with_links)
         if ec.content and len(ec.content.strip()) > 100:
@@ -2755,7 +2817,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.8.0")
+server = Server("free-web-search", version="5.9.0")
 
 
 @server.list_tools()
