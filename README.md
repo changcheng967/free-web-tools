@@ -80,7 +80,8 @@ claude mcp add free-web-search -- python -m mcp_server
 
 ## Architecture
 
-- **Search**: DuckDuckGo Lite + Mojeek + Bing + Startpage (4-way parallel, merge results — better coverage)
+- **Search**: DuckDuckGo Lite + Mojeek + Bing + Startpage (4-way parallel, merge results — better coverage), plus **arXiv + Semantic Scholar + OpenAlex** academic backends that auto-activate for paper/论文 queries or `arxiv.org`/`openreview.net` domain filters (general engines are bad at finding papers)
+- **TLS**: uses the OS native certificate store (`truststore`) so HTTPS works behind intercepting proxies/VPNs/antivirus that break `certifi` verification; curl_cffi falls back to unverified only if a cert error occurs
 - **Answer engine**: DuckDuckGo Instant Answer API + Wikipedia fallback (structured factual data)
 - **Encyclopedia**: Wikipedia REST Summary API (all languages) + MediaWiki Search API (full-text article search)
 - **Books**: Open Library Search API (free book search with covers, ISBN, metadata)
@@ -105,3 +106,4 @@ All free, pip-installable:
 - `trafilatura` — Content extraction
 - `pypdf` — PDF text extraction
 - `curl_cffi` — Chrome TLS impersonation to bypass Cloudflare/bot-blocks
+- `truststore` — OS-native TLS roots (fixes HTTPS behind intercepting proxies/VPNs/AV)

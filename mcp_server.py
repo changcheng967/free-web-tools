@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Web Search MCP Server v5.9.0.
+"""Free Web Search MCP Server v5.10.0.
 
 Zero-cost web search and content extraction via MCP protocol.
 Uses DuckDuckGo Lite + Mojeek + Bing + Startpage for search (parallel, first-wins),
@@ -25,6 +25,16 @@ from bs4 import BeautifulSoup
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
+
+# Use the OS native certificate store for TLS verification. This fixes HTTPS in
+# environments with a TLS-intercepting proxy / VPN / antivirus whose root CA is
+# trusted by the OS but not by the bundled certifi (httpx would otherwise fail
+# with CERTIFICATE_VERIFY_FAILED for every host). Safe no-op if unavailable.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -719,7 +729,151 @@ async def search_bing(
 
 
 # ---------------------------------------------------------------------------
-# Parallel search — race DDG + Mojeek + Bing + Startpage
+# Academic search — arXiv + Semantic Scholar + OpenAlex (free, no keys)
+# General engines are poor at finding papers; these search the literature directly.
+# ---------------------------------------------------------------------------
+
+_ACADEMIC_DOMAINS = {
+    "arxiv.org", "openreview.net", "semanticscholar.org", "scholar.google.com",
+    "aclanthology.org", "proceedings.mlr.press", "papers.nips.cc",
+    "openaccess.thecvf.com", "biorxiv.org", "medrxiv.org",
+    "dl.acm.org", "ieeexplore.ieee.org",
+}
+_ACADEMIC_KEYWORDS = (
+    "arxiv", "论文", "paper", "papers", "proceedings", "openreview",
+    "neurips", "icml", "iclr", "cvpr", "semantic scholar", "preprint",
+)
+
+
+def _is_academic_query(query: str, include_domains: list[str] | None = None) -> bool:
+    """Heuristic: should this query also hit academic literature backends?"""
+    if include_domains and any(d in _ACADEMIC_DOMAINS for d in include_domains):
+        return True
+    q = query.lower()
+    return any(kw in q for kw in _ACADEMIC_KEYWORDS)
+
+
+def _clean_academic_query(query: str) -> str:
+    """Strip generic filler words that hurt literature-API search relevance."""
+    return re.sub(r'\b(arxiv|arxiv\.org|paper|papers|preprint|研究|论文)\b', '', query, flags=re.IGNORECASE).strip()
+
+
+def _openalex_abstract(inv: dict | None) -> str:
+    """Reconstruct an abstract from OpenAlex's inverted-word index."""
+    if not isinstance(inv, dict):
+        return ""
+    pos: dict[int, str] = {}
+    for word, idxs in inv.items():
+        for i in idxs:
+            pos[i] = word
+    return " ".join(pos[i] for i in sorted(pos))
+
+
+async def search_arxiv(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Search arXiv via the official Atom API (free, no key)."""
+    client = _get_shared_client()
+    q = _clean_academic_query(query)
+    try:
+        resp = await client.get(
+            "http://export.arxiv.org/api/query",
+            params={"search_query": f"all:{q}", "max_results": max_results, "sortBy": "relevance"},
+            timeout=15.0,
+        )
+        soup = BeautifulSoup(resp.text, "xml")
+        results: list[SearchResult] = []
+        for entry in soup.find_all("entry"):
+            raw_id = entry.find("id").get_text().strip()
+            arxiv_id = raw_id.split("/abs/")[-1]
+            if not arxiv_id:
+                continue
+            title = " ".join(entry.find("title").get_text(strip=True).split())
+            summary = " ".join(entry.find("summary").get_text(strip=True).split())
+            authors = ", ".join(a.find("name").get_text(strip=True) for a in entry.find_all("author")[:4])
+            results.append(SearchResult(
+                title=title,
+                url=f"https://arxiv.org/abs/{arxiv_id}",
+                snippet=(f"{authors}. {summary}" if authors else summary)[:350],
+                source="arxiv",
+            ))
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as e:
+        logger.warning("arXiv search failed: %s", e)
+        return []
+
+
+async def search_semantic_scholar(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Search papers via the Semantic Scholar API (free, no key; rate-limited)."""
+    client = _get_shared_client()
+    q = _clean_academic_query(query)
+    try:
+        resp = await client.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": q, "limit": max_results,
+                    "fields": "title,year,abstract,externalIds,openAccessPdf"},
+            headers={"User-Agent": "free-web-tools-mcp"},
+            timeout=15.0,
+        )
+        items = resp.json().get("data", [])
+        results: list[SearchResult] = []
+        for p in items:
+            ids = p.get("externalIds") or {}
+            arxiv_id = ids.get("ArXiv")
+            doi = ids.get("DOI")
+            pdf = (p.get("openAccessPdf") or {}).get("url")
+            url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else (pdf or (f"https://doi.org/{doi}" if doi else ""))
+            if not url:
+                continue
+            title = p.get("title", "")
+            year = p.get("year") or ""
+            snippet = (p.get("abstract") or "").strip()
+            if year:
+                snippet = f"({year}) {snippet}"
+            results.append(SearchResult(title=title, url=url, snippet=snippet[:350], source="semantic_scholar"))
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as e:
+        logger.warning("Semantic Scholar search failed: %s", e)
+        return []
+
+
+async def search_openalex(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Search papers via the OpenAlex API (free, no key; broad coverage)."""
+    client = _get_shared_client()
+    q = _clean_academic_query(query)
+    try:
+        resp = await client.get(
+            "https://api.openalex.org/works",
+            params={"search": q, "per-page": max_results, "mailto": "free-web-tools-mcp@example.com"},
+            timeout=15.0,
+        )
+        items = resp.json().get("results", [])
+        results: list[SearchResult] = []
+        for w in items:
+            doi = (w.get("doi") or "").replace("https://doi.org/", "")
+            loc = w.get("best_oa_location") or w.get("primary_location") or {}
+            pdf = (loc.get("pdf_url") or "") if isinstance(loc, dict) else ""
+            url = pdf or (f"https://doi.org/{doi}" if doi else "") or (w.get("id") or "")
+            if not url:
+                continue
+            title = w.get("title", "")
+            year = w.get("publication_year") or ""
+            snippet = _openalex_abstract(w.get("abstract_inverted_index"))
+            if year:
+                snippet = f"({year}) {snippet}"
+            results.append(SearchResult(title=title, url=url, snippet=snippet[:350], source="openalex"))
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as e:
+        logger.warning("OpenAlex search failed: %s", e)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Parallel search — race DDG + Mojeek + Bing + Startpage (+ academic when relevant)
 # ---------------------------------------------------------------------------
 
 async def _parallel_search(
@@ -727,17 +881,20 @@ async def _parallel_search(
     max_results: int = 10,
     time_range: str | None = None,
     language: str | None = None,
+    include_domains: list[str] | None = None,
 ) -> tuple[list[SearchResult], dict[str, int]]:
     """Race all 4 search backends in parallel; merge and dedup results.
 
     Waits up to 8 seconds for backends to respond. Merges results from all
     backends that responded, deduplicates by URL, and returns the best results.
+    When the query looks academic, also races arXiv / Semantic Scholar / OpenAlex.
 
     Returns ``(results, source_counts)`` where source_counts maps each backend to
     how many results it returned (pre-dedup) — used to surface backend health so a
     dead/rotted backend can't fail silently.
     """
-    cache_key = ("search", query.lower().strip(), max_results, time_range or "", language or "")
+    cache_key = ("search", query.lower().strip(), max_results, time_range or "", language or "",
+                 tuple(sorted(include_domains)) if include_domains else ())
     hit = _search_cache.get(cache_key)
     if hit is not _CACHE_MISS:
         return hit
@@ -750,6 +907,11 @@ async def _parallel_search(
         asyncio.create_task(search_bing(query, fetch_count, language, time_range)): "bing",
         asyncio.create_task(search_startpage(query, fetch_count, time_range)): "startpage",
     }
+    # Academic queries: general engines are bad at finding papers; add literature APIs.
+    if _is_academic_query(query, include_domains):
+        task_sources[asyncio.create_task(search_arxiv(query, fetch_count))] = "arxiv"
+        task_sources[asyncio.create_task(search_semantic_scholar(query, fetch_count))] = "semantic_scholar"
+        task_sources[asyncio.create_task(search_openalex(query, fetch_count))] = "openalex"
     all_tasks = set(task_sources)
 
     # Wait for all backends with 8-second timeout
@@ -1316,18 +1478,27 @@ async def _fetch_with_curl_cffi(url: str) -> ExtractedContent | None:
     except ImportError:
         logger.info("curl_cffi unavailable; skipping TLS-impersonation fetch")
         return None
-    try:
-        async with AsyncSession(impersonate="chrome", timeout=20) as s:
-            resp = await s.get(url, headers=_search_headers(), allow_redirects=True)
-            if resp.status_code != 200:
-                return None
-            # PDF served without a .pdf URL: extract instead of returning garbage.
-            if resp.content[:4] == b"%PDF":
-                return _extract_pdf_text(resp.content, url)
-            return _extract_from_html(resp.text, url, method="curl_cffi")
-    except Exception as e:
-        logger.warning("curl_cffi fetch failed for %s: %s", url, e)
+    # curl_cffi uses libcurl's own CA bundle (truststore can't help it). In a
+    # TLS-intercepted environment that bundle won't trust the proxy CA, so retry
+    # once without verification on a certificate error (public read-only content).
+    resp = None
+    for verify in (True, False):
+        try:
+            async with AsyncSession(impersonate="chrome", timeout=20, verify=verify) as s:
+                resp = await s.get(url, headers=_search_headers(), allow_redirects=True)
+            break
+        except Exception as e:
+            if verify and ("cert" in str(e).lower() or "ssl" in str(e).lower()):
+                logger.warning("curl_cffi cert verify failed for %s; retrying unverified", url)
+                continue
+            logger.warning("curl_cffi fetch failed for %s: %s", url, e)
+            return None
+    if resp is None or resp.status_code != 200:
         return None
+    # PDF served without a .pdf URL: extract instead of returning garbage.
+    if resp.content[:4] == b"%PDF":
+        return _extract_pdf_text(resp.content, url)
+    return _extract_from_html(resp.text, url, method="curl_cffi")
 
 
 # ---------------------------------------------------------------------------
@@ -1428,7 +1599,7 @@ async def _arxiv_api_meta(client: httpx.AsyncClient, paper_id: str) -> dict | No
     try:
         resp = await client.get(
             f"http://export.arxiv.org/api/query?id_list={paper_id}",
-            headers={"User-Agent": "free-web-tools-mcp/5.9.0"},
+            headers={"User-Agent": "free-web-tools-mcp/5.10.0"},
             timeout=15.0,
             follow_redirects=True,
         )
@@ -1597,7 +1768,7 @@ async def _arxiv_abstract_scrape(client: httpx.AsyncClient, abs_url: str) -> Ext
 
 _GITHUB_API_HEADERS = {
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "free-web-tools-mcp/5.9.0",
+    "User-Agent": "free-web-tools-mcp/5.10.0",
 }
 
 
@@ -2817,7 +2988,7 @@ def format_auto_answer(
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("free-web-search", version="5.9.0")
+server = Server("free-web-search", version="5.10.0")
 
 
 @server.list_tools()
@@ -2829,13 +3000,16 @@ async def list_tools() -> list[Tool]:
                 "Search the web for information. Returns ranked results with titles, URLs, and snippets. "
                 "Uses DuckDuckGo + Mojeek + Bing + Startpage in parallel (first-wins for speed). "
                 "Supports time-range filtering, language selection, and domain filtering.\n\n"
+                "Academic/research queries (papers, 论文, or domain filters like arxiv.org/openreview.net) "
+                "also search arXiv + Semantic Scholar + OpenAlex directly — far better than general engines at finding papers.\n\n"
                 "Supports `site:` operator (e.g. `query=\"react hooks site:github.com\"`)\n\n"
                 "Examples:\n"
                 '- web_search(query="Python async best practices")\n'
                 '- web_search(query="React 19 release", time_range="month")\n'
                 '- web_search(query="climate change 2025", max_results=15)\n'
                 '- web_search(query="React hooks", include_domains=["github.com", "stackoverflow.com"])\n'
-                '- web_search(query="AI news", exclude_domains=["facebook.com"], language="en")'
+                '- web_search(query="AI news", exclude_domains=["facebook.com"], language="en")\n'
+                '- web_search(query="KVzip KV cache compression", include_domains=["arxiv.org"])'
             ),
             inputSchema={
                 "type": "object",
@@ -3398,7 +3572,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                     else:
                         include_domains = site_domains
 
-                results, source_counts = await _parallel_search(clean_query, max_results, time_range, language)
+                results, source_counts = await _parallel_search(clean_query, max_results, time_range, language, include_domains)
                 results = post_process_results(results)
                 results = _apply_domain_filter(results, include_domains, exclude_domains)
                 if not results:
@@ -3431,7 +3605,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
                     else:
                         include_domains = site_domains
 
-                results, source_counts = await _parallel_search(clean_query, max_results, time_range, language)
+                results, source_counts = await _parallel_search(clean_query, max_results, time_range, language, include_domains)
                 results = post_process_results(results)
                 results = _apply_domain_filter(results, include_domains, exclude_domains)
                 if not results:
